@@ -40,8 +40,8 @@ bb magic-compose history --days 14 --json
 
 ## Constraints
 
-- Every call needs a Vercel AI Gateway or OpenRouter key and at least one model
-  in the rotation, both set by the user in Settings → Magic Compose. Without them the
+- Every call needs a Vercel AI Gateway, OpenRouter, or OpenCode key and at least
+  one model in the rotation, both set by the user in Settings → Magic Compose. Without them the
   command exits 1 with a message saying which is missing. Do not ask the user to
   paste the key into chat.
 - `route` and `spawn` each normally make one Jev request. Add `--profile` to
@@ -50,4 +50,4 @@ bb magic-compose history --days 14 --json
 - Treat a pick with confidence under about 0.5 as a guess. Prefer `route` and
   show the user the alternatives before spawning on a guess.
 - The prompt, project names and folders, recent thread titles, and machine names
-  are sent to TypeSafe through Vercel or OpenRouter. Do not route prompts containing secrets.
+  are sent to TypeSafe through Vercel, OpenRouter, or OpenCode. Do not route prompts containing secrets.

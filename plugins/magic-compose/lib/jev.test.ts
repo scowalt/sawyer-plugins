@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { askChoice, askChoices, askChoicesVia, JEV_PROVIDERS, JevError } from "./jev";
 
 const question = {
@@ -182,6 +182,75 @@ describe("askChoice on OpenRouter", () => {
       }).catch((cause: unknown) => cause as JevError);
     expect(await ask(401)).toMatchObject({ code: "auth", message: expect.stringContaining("OpenRouter") });
     expect(await ask(402)).toMatchObject({ code: "no_credit" });
+  });
+});
+
+describe("askChoice on OpenCode", () => {
+  it("speaks the System One endpoint with the model in the body", async () => {
+    let request: { url: string; init: RequestInit } | undefined;
+    const fetchImpl: typeof fetch = async (url, init) => {
+      request = { url: String(url), init: init ?? {} };
+      return new Response(
+        JSON.stringify({
+          model: "jev-1.13-free",
+          answers: {
+            q0: { type: "choice", choice: "games", confidence: 0.81, probabilities: { bb: 0.1, games: 0.9 } },
+          },
+          usage: { input_tokens: 336, output_tokens: 39, cost: 0, opencode: { billing_source: "free" } },
+        }),
+      );
+    };
+
+    const answer = await askChoice({
+      provider: "opencode",
+      apiKey: "sk-opencode",
+      model: "jev-1.13-free",
+      state: { task: "Add a lap counter" },
+      question: { instructions: "Pick the project.", options: { bb: "The BB app.", games: null } },
+      fetchImpl,
+    });
+
+    expect(request?.url).toBe("https://opencode.ai/inference/systemone/v1/systemone");
+    const headers = request?.init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer sk-opencode");
+    expect(headers["X-Title"]).toBeUndefined();
+    expect(JSON.parse(String(request?.init.body))).toEqual({
+      model: "jev-1.13-free",
+      state: { task: "Add a lap counter" },
+      questions: {
+        q0: { type: "choice", instructions: "Pick the project.", criteria: { bb: "The BB app.", games: "" } },
+      },
+    });
+    expect(answer).toMatchObject({
+      choice: "games",
+      probabilities: { bb: 0.1, games: 0.9 },
+      confidence: 0.81,
+      inputTokens: 336,
+    });
+  });
+
+  it("sends over fetch rather than the HTTP/2 connection, which OpenCode refuses", async () => {
+    const fetchMock = vi.fn<typeof fetch>(respond(200, { answers: { q0: { type: "choice", choice: "bb" } } }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const answer = await askChoice({ provider: "opencode", apiKey: "k", model: "jev-1.13-free", state: "s", question });
+      expect(answer.choice).toBe("bb");
+      expect(fetchMock).toHaveBeenCalledWith(JEV_PROVIDERS.opencode.url, expect.objectContaining({ method: "POST" }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("names OpenCode when it rate-limits", async () => {
+    const error = await askChoice({
+      provider: "opencode",
+      apiKey: "k",
+      model: "jev-1.13-free",
+      state: "s",
+      question,
+      fetchImpl: respond(429, { error: { message: "Too many requests" } }),
+    }).catch((cause: unknown) => cause as JevError);
+    expect(error).toMatchObject({ code: "rate_limited", message: "OpenCode rate-limited Jev (HTTP 429)." });
   });
 });
 

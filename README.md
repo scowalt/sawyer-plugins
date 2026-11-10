@@ -2,6 +2,8 @@
 
 Sawyer Hood's [BB](https://getbb.app) plugins, in one repository. Every plugin lives under `plugins/<id>/` as an ordinary plugin package with its own `package.json`, and `.bb/plugins.json` indexes them as a collection.
 
+This is [scowalt](https://github.com/scowalt)'s fork of [SawyerHood/sawyer-plugins](https://github.com/SawyerHood/sawyer-plugins), rebased onto upstream daily. Its only change is that Magic Compose can also reach Jev through [OpenCode](https://opencode.ai/docs/zen/), including the free `jev-1.13-free` model.
+
 | Plugin | Directory | What it does |
 | --- | --- | --- |
 | Better Notes | [`plugins/better-notes`](plugins/better-notes) | An editable fork of BB’s built-in document and notes library. |

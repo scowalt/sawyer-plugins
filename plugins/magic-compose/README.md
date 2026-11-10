@@ -1,6 +1,6 @@
 # Magic Compose
 
-A BB plugin that picks where a new thread runs. Switch on **Magic Compose**, the wand button beside the send button in the new-thread composer, and [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's classifier model, chooses the project, machine, model, reasoning level, and environment as you type. It calls Jev with your own key, through the [Vercel AI Gateway](https://vercel.com/changelog/typesafe-ai-jev-now-available-on-ai-gateway), [OpenRouter](https://openrouter.ai/typesafe/jev-1.13), or both.
+A BB plugin that picks where a new thread runs. Switch on **Magic Compose**, the wand button beside the send button in the new-thread composer, and [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's classifier model, chooses the project, machine, model, reasoning level, and environment as you type. It calls Jev with your own key, through the [Vercel AI Gateway](https://vercel.com/changelog/typesafe-ai-jev-now-available-on-ai-gateway), [OpenRouter](https://openrouter.ai/typesafe/jev-1.13), [OpenCode](https://opencode.ai/docs/zen/), or several of them.
 
 - With Magic Compose on, the composer's pickers follow the draft: Jev is asked again as you type, and the project, machine, environment, model, and reasoning pickers move to its answer. Nothing is hidden, so you see every choice, and you send the thread yourself.
 - Send waits for Jev. From the first keystroke until the pickers match the text on screen, the send button is dimmed and Enter does nothing, so what runs is what you were shown. That is usually a fraction of a second after you stop typing.
@@ -11,14 +11,14 @@ A BB plugin that picks where a new thread runs. Switch on **Magic Compose**, the
 ## Install
 
 ```sh
-bb plugin install git:https://github.com/SawyerHood/sawyer-plugins.git --plugin magic-compose
+bb plugin install git:https://github.com/scowalt/sawyer-plugins.git --plugin magic-compose
 ```
 
 ## Set up
 
 Open **Settings → Magic Compose**. The page runs in the order you need it.
 
-1. **Configuration.** Paste a **Vercel AI Gateway API key** (Vercel dashboard → AI Gateway → API keys), an **OpenRouter API key** ([openrouter.ai/keys](https://openrouter.ai/keys)), or both. Keys are stored as secrets on the BB server and never sent to the browser. **Jev provider** picks which to use: `auto` uses whichever key is set, and with both set it asks the Vercel AI Gateway first and OpenRouter if that fails.
+1. **Configuration.** Paste a **Vercel AI Gateway API key** (Vercel dashboard → AI Gateway → API keys), an **OpenRouter API key** ([openrouter.ai/keys](https://openrouter.ai/keys)), an **OpenCode API key** (the key from an OpenCode Go or pay-as-you-go account, at [opencode.ai/console](https://opencode.ai/console)), or several. Keys are stored as secrets on the BB server and never sent to the browser. **Jev provider** picks which to use: `auto` uses whichever keys are set, asking the Vercel AI Gateway first, then OpenRouter, then OpenCode, each only if the one before fails.
 2. **Try it.** Route a prompt without starting anything. The line above it says whether Jev was reached, through which gateway, and how long the last decision took, so it is also the quickest check that a key works. Come back to it after every change below.
 3. **In the composer.** What Magic Compose does while it is on:
    - **Magic Compose may set** chooses which pickers are Magic Compose's: project, machine and environment, model, effort. Switch one off and it is always yours. With the project off, Magic Compose routes within whichever project the composer is on. Effort needs Model, because Jev chooses the effort for the model it chose.
@@ -76,7 +76,7 @@ The plugin ships a `tune-magic-compose` skill. Ask an agent to “tune Magic Com
 
 ## Privacy and cost
 
-With Magic Compose on, the draft is sent as you type, not only when you send it (or each time you pause, if you set **Ask Jev** to “When I pause”): every decision sends the prompt so far (the first 9,000 and last 3,000 characters of a long one), your instructions, project names, folders, remotes, and recent thread titles, and machine names and load to TypeSafe through the gateway you chose: the Vercel AI Gateway or OpenRouter. Jev costs $0.042 per million input tokens and a decision is a few thousand tokens, a small fraction of a cent; a prompt typed over ten seconds takes about fifteen of them. The Vercel AI Gateway's free tier allows only about 10 Jev calls per 5 minutes, which Magic Compose uses up within one prompt; any Gateway credit lifts that. OpenRouter bills the same price from your OpenRouter credit.
+With Magic Compose on, the draft is sent as you type, not only when you send it (or each time you pause, if you set **Ask Jev** to “When I pause”): every decision sends the prompt so far (the first 9,000 and last 3,000 characters of a long one), your instructions, project names, folders, remotes, and recent thread titles, and machine names and load to TypeSafe through the gateway you chose: the Vercel AI Gateway, OpenRouter, or OpenCode. Jev costs $0.042 per million input tokens and a decision is a few thousand tokens, a small fraction of a cent; a prompt typed over ten seconds takes about fifteen of them. The Vercel AI Gateway's free tier allows only about 10 Jev calls per 5 minutes, which Magic Compose uses up within one prompt; any Gateway credit lifts that. OpenRouter bills the same price from your OpenRouter credit. OpenCode uses `jev-1.13-free` by default, which it offers free for a limited time; set **Jev model id on OpenCode** under Advanced to `jev-1.13` to pay the same price from your OpenCode balance instead.
 
 ## Limits
 
@@ -96,4 +96,4 @@ npm run build
 bb plugin install . --yes
 ```
 
-`lib/router.ts` holds the routing logic, `lib/live-fill.ts` schedules decisions as the draft changes, `lib/fill.ts` turns a decision into a composer selection, `lib/session.ts` keeps one Magic Compose session per composer, `lib/preferences.ts` is the plugin's own settings, shared by the server and the app, `lib/jev.ts` the Jev client for both gateways, `lib/transport.ts` the warm connection, and `lib/history.ts` the backtest scoring; all but the transport are pure and covered by tests. `server.ts` gathers candidates from the BB SDK and spawns the thread, `host.ts` reports machine stats, `app.tsx` owns the toggle, and `settings.tsx` the settings page.
+`lib/router.ts` holds the routing logic, `lib/live-fill.ts` schedules decisions as the draft changes, `lib/fill.ts` turns a decision into a composer selection, `lib/session.ts` keeps one Magic Compose session per composer, `lib/preferences.ts` is the plugin's own settings, shared by the server and the app, `lib/jev.ts` the Jev client for every gateway, `lib/transport.ts` the warm connection, and `lib/history.ts` the backtest scoring; all but the transport are pure and covered by tests. `server.ts` gathers candidates from the BB SDK and spawns the thread, `host.ts` reports machine stats, `app.tsx` owns the toggle, and `settings.tsx` the settings page.

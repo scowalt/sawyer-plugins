@@ -6,28 +6,45 @@
 //   protocol, so this speaks that protocol with fetch rather than bundling the
 //   SDK. That also sidesteps the SDK rejecting near-tied answers whose rounded
 //   probabilities put the pick second.
-// - OpenRouter serves Jev from its Decisions endpoint.
+// - OpenRouter serves Jev from its Decisions endpoint, and OpenCode from its
+//   System One endpoint. Both take TypeSafe's own request shape.
 import { z } from "zod";
 import { DEFAULT_JEV_MODELS } from "./preferences";
 import { jevTransport } from "./transport";
 
-export type JevProvider = "vercel" | "openrouter";
+export type JevProvider = "vercel" | "openrouter" | "opencode";
 
 export const JEV_PROVIDERS: Record<
   JevProvider,
-  { name: string; url: string; defaultModel: string; keysUrl: string }
+  {
+    name: string;
+    url: string;
+    defaultModel: string;
+    keysUrl: string;
+    /** Whether the gateway speaks HTTP/2, which the warm connection needs. */
+    http2: boolean;
+  }
 > = {
   vercel: {
     name: "Vercel AI Gateway",
     url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
     defaultModel: DEFAULT_JEV_MODELS.vercel,
     keysUrl: "https://vercel.com/dashboard → AI Gateway → API keys",
+    http2: true,
   },
   openrouter: {
     name: "OpenRouter",
     url: "https://openrouter.ai/api/alpha/decisions",
     defaultModel: DEFAULT_JEV_MODELS.openrouter,
     keysUrl: "https://openrouter.ai/keys",
+    http2: true,
+  },
+  opencode: {
+    name: "OpenCode",
+    url: "https://opencode.ai/inference/systemone/v1/systemone",
+    defaultModel: DEFAULT_JEV_MODELS.opencode,
+    keysUrl: "https://opencode.ai/console",
+    http2: false,
   },
 };
 
@@ -102,7 +119,7 @@ const answerSchema = z.object({
 });
 
 // Vercel reports usage in camelCase and confidence under provider metadata;
-// OpenRouter reports usage in snake_case and confidence on the answer.
+// OpenRouter and OpenCode report usage in snake_case and confidence on the answer.
 const responseSchema = z.object({
   answers: z.record(z.string(), answerSchema),
   usage: z
@@ -116,7 +133,7 @@ function buildRequest(args: AskChoicesArgs): { headers: Record<string, string>; 
     Authorization: `Bearer ${args.apiKey}`,
     "Content-Type": "application/json",
   };
-  // OpenRouter's schema wants a string for every option; Vercel accepts null.
+  // TypeSafe's shape wants a string for every option; Vercel accepts null.
   const questions = Object.fromEntries(
     Object.values(args.questions).map((question, index) => [
       wireId(index),
@@ -124,17 +141,17 @@ function buildRequest(args: AskChoicesArgs): { headers: Record<string, string>; 
         type: "choice",
         instructions: question.instructions,
         criteria:
-          args.provider === "openrouter"
-            ? Object.fromEntries(
+          args.provider === "vercel"
+            ? question.options
+            : Object.fromEntries(
                 Object.entries(question.options).map(([name, text]) => [name, text ?? ""]),
-              )
-            : question.options,
+              ),
       },
     ]),
   );
-  if (args.provider === "openrouter") {
+  if (args.provider !== "vercel") {
     return {
-      headers: { ...base, "X-Title": "BB Magic Compose" },
+      headers: args.provider === "openrouter" ? { ...base, "X-Title": "BB Magic Compose" } : base,
       body: { model: args.model, state: args.state, questions },
     };
   }
@@ -186,7 +203,7 @@ function errorForStatus(provider: JevProvider, status: number, body: string): Je
       "rate_limited",
       provider === "vercel"
         ? `The Vercel AI Gateway rate-limited Jev (HTTP ${status}). The free tier allows about 10 Jev calls per 5 minutes; add Gateway credits to lift it.`
-        : `OpenRouter rate-limited Jev (HTTP ${status}).`,
+        : `${name} rate-limited Jev (HTTP ${status}).`,
     );
   }
   return new JevError(
@@ -225,14 +242,15 @@ async function requestOnce(
 ): Promise<Record<string, ChoiceAnswer>> {
   const startedAt = Date.now();
   const { headers, body: requestBody } = buildRequest(args);
-  const { url } = JEV_PROVIDERS[args.provider];
+  const { url, http2 } = JEV_PROVIDERS[args.provider];
   const payload = JSON.stringify(requestBody);
   let status: number;
   let body: string;
-  if (args.fetchImpl === undefined) {
+  if (args.fetchImpl === undefined && http2) {
     ({ status, body } = await jevTransport.post(url, headers, payload, signal));
   } else {
-    const response = await args.fetchImpl(url, { method: "POST", signal, headers, body: payload });
+    const send = args.fetchImpl ?? fetch;
+    const response = await send(url, { method: "POST", signal, headers, body: payload });
     status = response.status;
     body = await response.text();
   }
@@ -364,11 +382,13 @@ export async function askChoice(args: AskChoiceArgs): Promise<ChoiceAnswer> {
 /**
  * Open the connection to each route's gateway ahead of need. A new connection
  * is primed with one trivial question, a few hundred tokens, so that the slow
- * first request is not the user's.
+ * first request is not the user's. A gateway without HTTP/2 is reached with
+ * fetch, which drops idle connections after four seconds, so it is skipped.
  */
 export async function warmRoutes(routes: readonly JevRoute[]): Promise<void> {
+  const warmable = routes.filter((route) => JEV_PROVIDERS[route.provider].http2);
   await Promise.all(
-    routes.map((route) =>
+    warmable.map((route) =>
       jevTransport.warm(JEV_PROVIDERS[route.provider].url, () =>
         askChoices({
           ...route,

@@ -10,6 +10,7 @@ import { z } from "zod";
 export const DEFAULT_JEV_MODELS = {
   vercel: "typesafe-ai/jev",
   openrouter: "typesafe/jev-1.13",
+  opencode: "jev-1.13-free",
 } as const;
 
 export const PERMISSION_MODES = ["accept-edits", "auto", "full"] as const;
@@ -39,6 +40,7 @@ const fields = {
   permissionMode: z.enum(PERMISSION_MODES),
   jevModel: jevModelSchema,
   openRouterJevModel: jevModelSchema,
+  openCodeJevModel: jevModelSchema,
   /** Which of the composer's pickers Magic Compose may set. Effort is chosen per model, so it needs `model`. */
   maySet: maySetSchema,
   /** Hold the composer's send until the pickers match the draft. */
@@ -64,6 +66,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   permissionMode: "auto",
   jevModel: DEFAULT_JEV_MODELS.vercel,
   openRouterJevModel: DEFAULT_JEV_MODELS.openrouter,
+  openCodeJevModel: DEFAULT_JEV_MODELS.opencode,
   maySet: { project: true, placement: true, model: true, effort: true },
   holdSend: true,
   pace: "typing",
