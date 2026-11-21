@@ -9,6 +9,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { DecisionSummary, rpcContract, ScopeOptions } from "./server";
 import type { RotationEntry } from "./lib/router";
+import { DEFAULT_SHARE_USAGE, type ShareRule } from "./lib/share";
 import {
   DEFAULT_PREFERENCES,
   INSTRUCTIONS_MAX,
@@ -278,9 +279,32 @@ function Pick({ title, pick }: { title: string; pick: DecisionSummary["reasoning
       <span className="text-muted-foreground">
         {pick.source === "only-option"
           ? "only option"
-          : `${percent(pick.probability)}${pick.source === "fallback" ? " fallback" : ""}`}
+          : pick.source === "share"
+            ? "share"
+            : `${percent(pick.probability)}${pick.source === "fallback" ? " fallback" : ""}`}
       </span>
       {others.length > 0 && <div className="text-muted-foreground">also {others.join(", ")}</div>}
+    </div>
+  );
+}
+
+function shareText(share: NonNullable<DecisionSummary["share"]>): string {
+  const odds = `${Math.round(share.odds * 100)}%`;
+  switch (share.outcome) {
+    case "drawn":
+      return `drawn, replacing ${share.replaced?.label ?? "Jev's pick"} ${share.replaced?.reasoning ?? ""} · ${share.note}`;
+    case "kept":
+      return `not drawn (${odds}) · ${share.note}`;
+    case "skipped":
+      return `skipped: ${share.note}`;
+  }
+}
+
+function ShareChip({ share }: { share: NonNullable<DecisionSummary["share"]> }) {
+  return (
+    <div className="rounded-md border border-border px-2.5 py-1 text-xs">
+      <span className="text-muted-foreground">Share</span>{" "}
+      <span className="text-foreground">{shareText(share)}</span>
     </div>
   );
 }
@@ -353,6 +377,7 @@ function TrySection() {
           <Pick title="Environment" pick={decision.environment} />
           <Pick title="Model" pick={decision.model} />
           <Pick title="Effort" pick={decision.reasoning} />
+          {decision.share !== null && <ShareChip share={decision.share} />}
         </div>
       )}
     </div>
@@ -715,19 +740,216 @@ function RotationRow({
   );
 }
 
+/** A number field saved when it is left; an unusable value is put back. */
+function NumberField({
+  label,
+  value,
+  min,
+  max,
+  scale = 1,
+  onSave,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  /** The field shows `value × scale`. */
+  scale?: number;
+  onSave(next: number): void;
+}) {
+  const shown = String(Math.round(value * scale * 100) / 100);
+  const [draft, setDraft] = useState(shown);
+  useEffect(() => setDraft(shown), [shown]);
+  return (
+    <Input
+      className="w-20"
+      inputMode="decimal"
+      value={draft}
+      aria-label={label}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={() => {
+        const next = Number(draft);
+        if (draft.trim() === "" || !(next >= min && next <= max)) {
+          setDraft(shown);
+          return;
+        }
+        if (next / scale !== value) onSave(next / scale);
+      }}
+    />
+  );
+}
+
+function ShareText({
+  label,
+  value,
+  onSave,
+}: {
+  label: string;
+  value: string;
+  onSave(next: string): void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  return (
+    <Input
+      className="w-56"
+      value={draft}
+      maxLength={200}
+      aria-label={label}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={() => {
+        const next = draft.trim();
+        if (next === "") setDraft(value);
+        else if (next !== value) onSave(next);
+      }}
+    />
+  );
+}
+
+/** The random share: a model that gets a slice of new threads after Jev picks, while its quota allows. */
+function ShareBlock({
+  rule,
+  onChange,
+  onAdd,
+}: {
+  rule: ShareRule | null;
+  onChange(next: ShareRule | null): void;
+  onAdd(): void;
+}) {
+  if (rule === null) {
+    return (
+      <div className="space-y-2">
+        <p className="text-xs text-muted-foreground">
+          No random share. Magic Compose can send a slice of new threads to one more model at
+          random, so you can compare it with the rotation on real work.
+        </p>
+        <Button variant="outline" size="sm" onClick={onAdd}>
+          <Icon name="Plus" className="size-4" />
+          Add a random share
+        </Button>
+      </div>
+    );
+  }
+  const usage = (patch: Partial<ShareRule["usage"]>) =>
+    onChange({ ...rule, usage: { ...rule.usage, ...patch } });
+  return (
+    <div className="space-y-2">
+      <Card>
+        <Row name="Model and effort" detail="Jev never sees this model as an option.">
+          <ProviderModelPicker
+            value={{
+              providerId: rule.providerId,
+              model: rule.model,
+              reasoningLevel: rule.reasoningLevel,
+            }}
+            onChange={(value) =>
+              onChange({
+                ...rule,
+                providerId: value.providerId,
+                model: value.model,
+                reasoningLevel: value.reasoningLevel,
+              })
+            }
+          />
+        </Row>
+        <Row name="Share of new threads" detail="Percent">
+          <NumberField
+            label="Share of new threads, in percent"
+            value={rule.share}
+            min={0}
+            max={100}
+            scale={100}
+            onSave={(share) => onChange({ ...rule, share })}
+          />
+        </Row>
+        <Row name="Usage group" detail="The quota group this model counts against, as its source names it.">
+          <ShareText label="Usage group" value={rule.usage.group} onSave={(group) => usage({ group })} />
+        </Row>
+        <Row name="Usage source" detail="The provider usage source that reports it.">
+          <ShareText
+            label="Usage source id"
+            value={rule.usage.sourceId}
+            onSave={(sourceId) => usage({ sourceId })}
+          />
+        </Row>
+        <Row name="Stop at, 5-hour window" detail="Percent of the group's 5-hour window">
+          <NumberField
+            label="Stop at this percent of the 5-hour window"
+            value={rule.usage.maxSessionPercent}
+            min={1}
+            max={100}
+            onSave={(maxSessionPercent) => usage({ maxSessionPercent })}
+          />
+        </Row>
+        <Row name="Stop at, weekly window" detail="Percent of the group's weekly window">
+          <NumberField
+            label="Stop at this percent of the weekly window"
+            value={rule.usage.maxWeeklyPercent}
+            min={1}
+            max={100}
+            onSave={(maxWeeklyPercent) => usage({ maxWeeklyPercent })}
+          />
+        </Row>
+      </Card>
+      <p className="text-xs text-muted-foreground">
+        Magic Compose sends this share of new threads here at random after Jev picks, only while
+        the group is under both limits; a hot week lowers the share.
+      </p>
+      <Button variant="ghost" size="sm" onClick={() => onChange(null)}>
+        <Icon name="Trash2" className="size-4" />
+        Remove the random share
+      </Button>
+    </div>
+  );
+}
+
 function ModelsSection() {
   const rpc = useRpc<typeof rpcContract>();
   const scope = useScope();
   const preferences = usePreferences();
   const [entries, setEntries] = useState<RotationEntry[] | null>(null);
+  const [share, setShare] = useState<ShareRule | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     rpc.call("rotation_get").then(
-      (result) => setEntries(result.entries),
+      (result) => {
+        setEntries(result.entries);
+        setShare(result.share);
+      },
       (cause) => setError(errorMessage(cause)),
     );
   }, [rpc]);
+
+  const saveShare = useCallback(
+    (next: ShareRule | null) => {
+      setShare(next);
+      rpc.call("rotation_set", { entries: entries ?? [], share: next }).then(
+        () => setError(null),
+        (cause) => setError(errorMessage(cause)),
+      );
+    },
+    [rpc, entries],
+  );
+
+  const addShare = useCallback(async () => {
+    try {
+      const { seed } = await rpc.call("rotation_seed");
+      if (seed === null) {
+        setError("No agent provider is available to pick a model from.");
+        return;
+      }
+      saveShare({
+        providerId: seed.providerId,
+        model: seed.model,
+        reasoningLevel: seed.reasoningLevel,
+        share: 0.2,
+        usage: DEFAULT_SHARE_USAGE,
+      });
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  }, [rpc, saveShare]);
 
   const save = useCallback(
     (next: RotationEntry[]) => {
@@ -780,6 +1002,9 @@ function ModelsSection() {
       <p className="text-xs text-muted-foreground">
         The effort on a row is only a fallback, for a model that offers no choice of effort.
       </p>
+
+      <Label>Random share</Label>
+      <ShareBlock rule={share} onChange={saveShare} onAdd={() => void addShare()} />
 
       <Label>Effort Magic Compose may use</Label>
       {scope.state === null ? (

@@ -7,18 +7,28 @@ import type { ExperimentalComposerSelection } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import { HOLD_ATTRIBUTE, holdSubmit } from "./composer-dom";
 import { changedSelection } from "./fill";
+import { createDraftDraw } from "./draft-draw";
 import { createLiveFill, type LiveFill } from "./live-fill";
+
+/** What a round decided: what to set in the composer, and what to tell the user about it. */
+export interface RoutedSelection {
+  selection: ExperimentalComposerSelection;
+  /** Set when the random share chose the model, to say so. Null otherwise. */
+  note: string | null;
+}
 
 /** What only a mounted plugin surface can do. Replaced each time one mounts. */
 export interface SessionHandles {
-  /** Ask the server where `text` should run. */
-  route(text: string): Promise<ExperimentalComposerSelection>;
+  /** Ask the server where `text` should run. `draw` is the draft's one draw for the random share. */
+  route(text: string, draw: number): Promise<RoutedSelection>;
   /** The composer's own `experimental_setSelection`. */
   setSelection(selection: ExperimentalComposerSelection): Promise<unknown>;
 }
 
 export interface Session {
   live: LiveFill;
+  /** The draft's current text, for the live fill and for the share's one draw per draft. */
+  setText(text: string): void;
   attach(handles: SessionHandles): void;
   /** Whether send waits for Magic Compose. Off, a draft may go before the pickers catch up. */
   setHoldSend(hold: boolean): void;
@@ -30,6 +40,9 @@ export interface Session {
   /** How many times Magic Compose has moved this composer's pickers. The wand casts on each. */
   getCasts(): number;
   subscribeCasts(listener: () => void): () => void;
+  /** What the last applied decision has to say for itself, such as that the share chose it. */
+  getNote(): string | null;
+  subscribeNote(listener: () => void): () => void;
 }
 
 interface Entry {
@@ -54,19 +67,27 @@ function createEntry(root: HTMLElement): Entry {
   let maySet: string | null = null;
   let casts = 0;
   const castListeners = new Set<() => void>();
+  let note: string | null = null;
+  const noteListeners = new Set<() => void>();
+  const draftDraw = createDraftDraw(Math.random);
   const current = (): SessionHandles => {
     if (handles === null || entry.surfaces === 0) throw new DetachedError("Magic Compose is not on screen.");
     return handles;
   };
 
-  const live = createLiveFill<ExperimentalComposerSelection>({
-    route: async (text) => current().route(text),
-    apply: async (selection, previous) => {
-      const changed = changedSelection(previous, selection);
-      if (Object.keys(changed).length === 0) return;
-      await current().setSelection(changed);
-      casts += 1;
-      for (const listener of [...castListeners]) listener();
+  const live = createLiveFill<RoutedSelection>({
+    route: async (text) => current().route(text, draftDraw.forText(text)),
+    apply: async (routed, previous) => {
+      const changed = changedSelection(previous?.selection ?? null, routed.selection);
+      if (Object.keys(changed).length > 0) {
+        await current().setSelection(changed);
+        casts += 1;
+        for (const listener of [...castListeners]) listener();
+      }
+      if (routed.note !== note) {
+        note = routed.note;
+        for (const listener of [...noteListeners]) listener();
+      }
     },
     now: () => Date.now(),
     setTimer: (run, ms) => setTimeout(run, ms),
@@ -96,6 +117,11 @@ function createEntry(root: HTMLElement): Entry {
   const entry: Entry = {
     session: {
       live,
+      setText(text) {
+        // Seen before the live fill, which ignores an empty draft: it is what starts a new draw.
+        draftDraw.forText(text);
+        live.setText(text);
+      },
       attach(next) {
         handles = next;
       },
@@ -115,12 +141,20 @@ function createEntry(root: HTMLElement): Entry {
           castListeners.delete(listener);
         };
       },
+      getNote: () => note,
+      subscribeNote(listener) {
+        noteListeners.add(listener);
+        return () => {
+          noteListeners.delete(listener);
+        };
+      },
     },
     surfaces: 0,
     disposeTimer: null,
     dispose() {
       unsubscribe();
       castListeners.clear();
+      noteListeners.clear();
       releaseHold();
       live.dispose();
       root.removeAttribute(HOLD_ATTRIBUTE);

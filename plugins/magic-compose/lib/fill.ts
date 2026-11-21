@@ -44,6 +44,19 @@ export function selectionFor(
   };
 }
 
+/**
+ * What to tell the user when the random share, not Jev, chose the model the
+ * composer is set to. Null when it did not, or when Magic Compose may not set
+ * the model anyway.
+ */
+export function shareNote(decision: DecisionSummary, sets: MaySet): string | null {
+  const { share } = decision;
+  if (!sets.model || share === null || share.outcome !== "drawn" || share.replaced === null) {
+    return null;
+  }
+  return `Magic Compose: ${decision.model.label} by random share, in place of Jev's ${share.replaced.label}`;
+}
+
 function placement(selection: ExperimentalComposerSelection): string {
   const environment = selection.environment;
   if (environment?.type !== "provider") return JSON.stringify(environment ?? null);
