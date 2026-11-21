@@ -842,14 +842,22 @@ function ShareBlock({
               model: rule.model,
               reasoningLevel: rule.reasoningLevel,
             }}
-            onChange={(value) =>
+            onChange={(value) => {
+              // The picker also reports values it only reconciled, such as a service tier.
+              if (
+                value.providerId === rule.providerId &&
+                value.model === rule.model &&
+                value.reasoningLevel === rule.reasoningLevel
+              ) {
+                return;
+              }
               onChange({
                 ...rule,
                 providerId: value.providerId,
                 model: value.model,
                 reasoningLevel: value.reasoningLevel,
-              })
-            }
+              });
+            }}
           />
         </Row>
         <Row name="Share of new threads" detail="Percent">
