@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { ChoiceAnswer } from "./jev";
-import { DEFAULT_REASONING_LEVELS, type ReasoningLevel } from "./reasoning";
 import {
   clipTask,
   describeEnvironment,
   describeMachine,
-  describeModel,
   describeProject,
   route,
   uniqueOptionNames,
@@ -14,7 +12,6 @@ import {
   type Targets,
   type MachineCandidate,
   type MachineStats,
-  type ModelCandidate,
   type ProjectCandidate,
 } from "./router";
 
@@ -68,19 +65,6 @@ function project(overrides: Partial<ProjectCandidate> = {}): ProjectCandidate {
     gitRemoteUrl: null,
     sources: [],
     recentThreadTitles: [],
-    ...overrides,
-  };
-}
-
-function model(overrides: Partial<ModelCandidate> = {}): ModelCandidate {
-  return {
-    providerId: "claude-code",
-    providerName: "Claude Code",
-    model: "claude-opus-5",
-    displayName: "Opus 5",
-    description: "Most capable.",
-    note: "",
-    reasoningLevel: "medium",
     ...overrides,
   };
 }
@@ -155,15 +139,6 @@ describe("describeProject", () => {
   });
 });
 
-describe("describeModel", () => {
-  it("leads with the user's note", () => {
-    expect(describeModel(model({ note: "UI design and planning" }))).toBe(
-      "UI design and planning (Most capable.)",
-    );
-    expect(describeModel(model({ description: "" }))).toBe("A Claude Code model.");
-  });
-});
-
 describe("describeEnvironment", () => {
   it("explains the first-party environments by what they mean for the work", () => {
     expect(describeEnvironment(worktree)).toContain("isolated copy");
@@ -199,22 +174,15 @@ describe("clipTask", () => {
 describe("route", () => {
   const ios = project({ id: "proj_ios", name: "ios-app" });
   const bb = project();
-  const opus = model();
-  const sonnet = model({ model: "claude-sonnet-5", displayName: "Sonnet 5", note: "Simple tasks" });
   const mac = machine({ id: "host_mac", name: "MacBook", stats: stats({ platform: "darwin", arch: "arm64" }) });
   const devbox = machine();
   const instructions = {
     general: "I am a solo developer.",
     projects: "iOS work goes to ios-app.",
     machines: "iOS needs the Mac.",
-    models: "Sonnet for simple tasks.",
     environments: "Worktrees for code changes.",
   };
-  const noInstructions = { general: "", projects: "", machines: "", models: "", environments: "" };
-  const levels = [
-    { level: "low" as const, description: "Fast" },
-    { level: "high" as const, description: "Thorough" },
-  ];
+  const noInstructions = { general: "", projects: "", machines: "", environments: "" };
 
   /** A fake Jev: records each request and answers every question with `pick`. */
   function jev(pick: (key: string, options: string[]) => string | [string, Record<string, number>]) {
@@ -242,35 +210,26 @@ describe("route", () => {
   it("asks everything in one request, speculatively, and keeps the answers that apply", async () => {
     const fake = jev((key, options) => {
       if (key === "project") return ["ios-app", { "ios-app": 0.9, bb: 0.1 }];
-      if (key === "model") return "Opus 5 (Claude Code)";
-      if (key.startsWith("machine")) return "MacBook";
-      // Effort is asked once per model before the model is known.
-      return key === "reasoning:0" ? "high" : "low";
+      return "MacBook";
     });
     const decision = await route({
       task: "Fix the deep link crash in the iOS app",
       instructions,
       projects: [bb, ios],
-      models: [opus, sonnet],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: everywhere,
-      reasoningFor: () => levels,
     });
 
     expect(fake.batches).toHaveLength(1);
     expect(Object.keys(fake.batches[0]?.questions ?? {}).sort()).toEqual([
       "machine:0", // both projects can run on the same machines, so they share one question
-      "model",
       "project",
-      "reasoning:0",
-      "reasoning:1",
     ]);
     expect(decision.project.value.id).toBe("proj_ios");
     expect(decision.project.alternatives).toEqual([{ label: "bb", probability: 0.1 }]);
-    expect(decision.model.value.model).toBe("claude-opus-5");
-    expect(decision.reasoning.value).toBe("high"); // Opus's answer, not Sonnet's
+    // Magic Compose no longer chooses a model or an effort.
+    expect(Object.keys(decision).sort()).toEqual(["environment", "latencyMs", "machine", "project"]);
     expect(decision.machine.value.id).toBe("host_mac");
     expect(decision.environment).toMatchObject({ label: "Worktree", source: "only-option" });
 
@@ -281,11 +240,7 @@ describe("route", () => {
     });
     expect(fake.questions("project")[0]?.instructions).toContain("iOS work goes to ios-app.");
     expect(fake.questions("machine")[0]?.instructions).toContain("iOS needs the Mac.");
-    expect(fake.questions("reasoning")[0]?.instructions).toContain(
-      "The task will run on the model Opus 5 (Claude Code).",
-    );
-    expect(fake.questions("reasoning")[1]?.instructions).toContain("Sonnet 5 (Claude Code)");
-    expect(fake.questions("model")[0]?.instructions).not.toContain("iOS needs the Mac.");
+    expect(fake.questions("project")[0]?.instructions).not.toContain("iOS needs the Mac.");
   });
 
   it("asks a separate machine question for projects that live on different machines", async () => {
@@ -297,15 +252,12 @@ describe("route", () => {
       task: "Fix the deep link crash",
       instructions: noInstructions,
       projects: [bb, ios],
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: (candidate) =>
         candidate.id === "proj_ios"
           ? { machines: [mac, third], environments: [worktree] }
           : { machines: [devbox, mac], environments: [worktree] },
-      reasoningFor: () => [],
     });
     expect(fake.batches).toHaveLength(1);
     expect(fake.questions("machine").map((question) => Object.keys(question.options))).toEqual([
@@ -322,18 +274,13 @@ describe("route", () => {
       task: "hello",
       instructions: noInstructions,
       projects: [bb],
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: () => ({ machines: [devbox], environments: [worktree] }),
-      reasoningFor: () => [],
     });
     expect(fake.batches).toEqual([]);
     expect(decision.project.source).toBe("only-option");
     expect(decision.machine.value.id).toBe("host_devbox");
-    // A model with no reasoning choice keeps the rotation's fallback level.
-    expect(decision.reasoning.value).toBe("medium");
   });
 
   it("omits the rules block when the user wrote none", async () => {
@@ -342,12 +289,9 @@ describe("route", () => {
       task: "hello",
       instructions: { ...noInstructions, general: " " },
       projects: [bb, ios],
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: () => ({ machines: [devbox], environments: [worktree] }),
-      reasoningFor: () => [],
     });
     expect(fake.batches[0]?.state).toEqual({ task: "hello" });
     expect(fake.questions("project")[0]?.instructions).not.toContain("Routing rules");
@@ -363,15 +307,12 @@ describe("route", () => {
       task: "Refactor the router",
       instructions,
       projects: [bb],
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: () => ({
         machines: [machine({ environmentIds: ["git-worktree", "project-checkout"] }), omarchy],
         environments: [worktree, checkout, cow],
       }),
-      reasoningFor: () => [],
     });
 
     expect(fake.batches).toHaveLength(1);
@@ -397,9 +338,7 @@ describe("route", () => {
       task: "Refactor the router",
       instructions: noInstructions,
       projects: [bb],
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: () => ({
         machines: [
@@ -408,7 +347,6 @@ describe("route", () => {
         ],
         environments: [worktree, checkout],
       }),
-      reasoningFor: () => [],
     });
     expect(decision.environment).toMatchObject({ label: "Project checkout", source: "only-option" });
   });
@@ -421,9 +359,7 @@ describe("route", () => {
       task: "hello",
       instructions: noInstructions,
       projects,
-      models: [opus],
       hostNames: new Map(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: fake.ask,
       targetsFor: (candidate) => ({
         machines: [
@@ -432,7 +368,6 @@ describe("route", () => {
         ],
         environments: [worktree],
       }),
-      reasoningFor: () => [],
     });
     expect(fake.batches).toHaveLength(2);
     expect(Object.keys(fake.batches[0]?.questions ?? {}).length).toBeLessThanOrEqual(48);
@@ -440,54 +375,15 @@ describe("route", () => {
     expect(decision.machine.value.id).toBe("p59-b");
   });
 
-  it("only ever uses the effort levels the user allows", async () => {
-    const supported = [
-      { level: "high" as const, description: "" },
-      { level: "max" as const, description: "" },
-      { level: "ultracode" as const, description: "" },
-    ];
-    const run = async (reasoningLevels: readonly ReasoningLevel[], offered: typeof supported) => {
-      const fake = jev((_key, options) => options.at(-1) ?? "");
-      const decision = await route({
-        task: "Rework the whole app",
-        instructions: noInstructions,
-        projects: [bb],
-        models: [model({ reasoningLevel: "ultracode" })],
-        hostNames: new Map(),
-        reasoningLevels,
-        ask: fake.ask,
-        targetsFor: () => ({ machines: [devbox], environments: [worktree] }),
-        reasoningFor: () => offered,
-      });
-      return { options: Object.keys(fake.questions("reasoning")[0]?.options ?? {}), picked: decision.reasoning.value };
-    };
-
-    // By default the special run modes are not offered, even to a row set to one.
-    expect(await run(DEFAULT_REASONING_LEVELS, supported)).toEqual({
-      options: ["high", "max"],
-      picked: "max",
-    });
-    // A user who never wants max or ultracode gets neither, whatever the model supports.
-    expect(await run(["low", "medium", "high"], supported)).toEqual({ options: [], picked: "high" });
-    expect((await run(["low", "medium", "high"], supported.slice(1))).picked).toBe("medium");
-    // Opting in makes it available.
-    expect((await run(["high", "ultracode"], supported)).options).toEqual(["high", "ultracode"]);
-  });
-
-  it("fails clearly when no machine qualifies or the rotation is empty", async () => {
+  it("fails clearly when no machine qualifies", async () => {
     const base = {
       task: "hello",
       instructions: noInstructions,
       projects: [bb],
       hostNames: new Map<string, string>(),
-      reasoningLevels: DEFAULT_REASONING_LEVELS,
       ask: jev(() => "unused").ask,
       targetsFor: () => ({ machines: [], environments: [] }),
-      reasoningFor: () => [],
     };
-    await expect(route({ ...base, models: [opus] })).rejects.toThrow(
-      "No connected machine can run Opus 5 (Claude Code) in bb.",
-    );
-    await expect(route({ ...base, models: [] })).rejects.toThrow("Add at least one model");
+    await expect(route(base)).rejects.toThrow("No connected machine can run a thread in bb.");
   });
 });

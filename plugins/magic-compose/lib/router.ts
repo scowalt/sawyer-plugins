@@ -1,23 +1,19 @@
-// The routing decision: turn a prompt plus candidate projects, models, and
-// machines into Jev questions. Pure logic; server.ts supplies the data and the
-// Jev client.
+// The routing decision: turn a prompt plus candidate projects and machines into
+// Jev questions. The model and effort are not chosen here. Pure logic;
+// server.ts supplies the data and the Jev client.
 //
 // Jev answers many questions about one state in a single request, as fast as
 // it answers one. So this follows TypeSafe's speculative fan-out pattern: every
 // question that might matter goes out together, including ones that depend on
-// an answer not known yet ("which effort, if it runs on Fable?", "which machine,
-// if it lands in a project these five machines hold?"), and code keeps the
-// answers that turned out to apply. One round trip instead of three.
+// an answer not known yet ("which machine, if it lands in a project these five
+// machines hold?"), and code keeps the answers that turned out to apply. One
+// round trip instead of three.
 //
 // Jev is weak at arithmetic and numeric comparison. So everything here is
 // phrased in words ("CPU load is low") with the numbers alongside, and code
 // does the filtering that needs exact facts (which machines hold the project,
-// which run the model, which environments a machine can create).
+// which environments a machine can create).
 import type { ChoiceAnswer, ChoiceQuestion, JevState } from "./jev";
-import type { ReasoningLevel } from "./reasoning";
-import type { ShareDecision } from "./share";
-
-export { REASONING_LEVELS, type ReasoningLevel } from "./reasoning";
 
 export interface ProjectCandidate {
   id: string;
@@ -63,36 +59,14 @@ export interface EnvironmentCandidate {
   description: string;
 }
 
-export interface RotationEntry {
-  providerId: string;
-  model: string;
-  /** The user's "when to use this" note. */
-  note: string;
-  /** Used when the model has no reasoning levels to choose between. */
-  reasoningLevel: ReasoningLevel;
-}
-
-export interface ModelCandidate extends RotationEntry {
-  providerName: string;
-  displayName: string;
-  /** The provider catalog's own description of the model. */
-  description: string;
-}
-
-export interface ReasoningCandidate {
-  level: ReasoningLevel;
-  description: string;
-}
-
 export interface Instructions {
   general: string;
   projects: string;
   machines: string;
-  models: string;
   environments: string;
 }
 
-export type RouteDimension = "project" | "model" | "machine" | "reasoning" | "environment";
+export type RouteDimension = "project" | "machine" | "environment";
 
 /** One request to Jev: a shared state, and every question to answer about it. */
 export interface JevBatch {
@@ -108,9 +82,8 @@ export interface Pick<T> {
   /**
    * `only-option` means no Jev call was needed. `fallback` means none of the
    * user's preferred options could be used, so a backup was taken instead.
-   * `share` means the random share replaced what Jev picked.
    */
-  source: "jev" | "only-option" | "fallback" | "share";
+  source: "jev" | "only-option" | "fallback";
   probability: number | null;
   confidence: number | null;
   /** Runner-up options, best first. */
@@ -121,12 +94,8 @@ export interface Pick<T> {
 
 export interface RouteDecision {
   project: Pick<ProjectCandidate>;
-  model: Pick<ModelCandidate>;
   machine: Pick<MachineCandidate>;
-  reasoning: Pick<ReasoningLevel>;
   environment: Pick<EnvironmentCandidate>;
-  /** What the random share did after Jev picked. Null when there is no share to apply. */
-  share: ShareDecision | null;
   latencyMs: number;
 }
 
@@ -137,9 +106,9 @@ export class RouteError extends Error {
   }
 }
 
-/** Where a project could run with a model: facts worked out by code, not by Jev. */
+/** Where a project could run: facts worked out by code, not by Jev. */
 export interface Targets {
-  /** Machines that hold the project and can run the model. */
+  /** Machines that hold the project and can create an allowed environment for it. */
   machines: MachineCandidate[];
   /** The environments those machines can create, in the user's order of preference. */
   environments: EnvironmentCandidate[];
@@ -149,19 +118,12 @@ export interface RouteArgs {
   task: string;
   instructions: Instructions;
   projects: ProjectCandidate[];
-  models: ModelCandidate[];
   /** Machine id → name, for describing where each project lives. */
   hostNames: ReadonlyMap<string, string>;
   /** Answer every question in the batch. Called once, and again only for stragglers. */
   ask(batch: JevBatch): Promise<Record<string, ChoiceAnswer>>;
-  /**
-   * Synchronous, because it is consulted for every project and model before
-   * Jev has chosen either.
-   */
-  targetsFor(project: ProjectCandidate, model: ModelCandidate): Targets;
-  reasoningFor(model: ModelCandidate): ReasoningCandidate[];
-  /** The effort levels the user lets Magic Compose pick. Nothing outside it is ever used. */
-  reasoningLevels: readonly ReasoningLevel[];
+  /** Synchronous, because it is consulted for every project before Jev has chosen one. */
+  targetsFor(project: ProjectCandidate): Targets;
 }
 
 /** Beyond this many speculative questions, the rarer ones wait for a follow-up request. */
@@ -328,32 +290,12 @@ export function describeEnvironment(environment: EnvironmentCandidate): string {
   return description || `The ${environment.name} environment.`;
 }
 
-export function describeModel(model: ModelCandidate): string {
-  const note = model.note.trim();
-  const description = model.description.trim();
-  if (note !== "" && description !== "") return `${note} (${description})`;
-  return note || description || `A ${model.providerName} model.`;
-}
-
 /** A question's instructions: what to decide, what is already known, and the user's rules for it. */
 function instructionsFor(ask: string, known: string[], rules: string): string {
   const trimmed = rules.trim();
   return [ask, ...known, trimmed === "" ? "" : `Routing rules from the user:\n${trimmed}`]
     .filter((part) => part !== "")
     .join("\n\n");
-}
-
-function reasoningPick(level: ReasoningLevel): Pick<ReasoningLevel> {
-  return {
-    value: level,
-    label: level,
-    source: "only-option",
-    probability: null,
-    confidence: null,
-    alternatives: [],
-    latencyMs: 0,
-    inputTokens: null,
-  };
 }
 
 interface Planned<T> {
@@ -449,9 +391,6 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
   const startedAt = Date.now();
   if (args.task.trim() === "") throw new RouteError("There is no prompt to route.");
   if (args.projects.length === 0) throw new RouteError("There are no projects to choose from.");
-  if (args.models.length === 0) {
-    throw new RouteError("Add at least one model to the rotation in Magic Compose settings.");
-  }
 
   const general = args.instructions.general.trim();
   const fanout = new Fanout(
@@ -461,7 +400,6 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
     },
     args.ask,
   );
-  const allowedLevels = new Set(args.reasoningLevels);
 
   const projectPlan = planned(
     "project",
@@ -477,52 +415,9 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
     ),
   );
 
-  const modelNames = uniqueOptionNames(
-    args.models,
-    (candidate) => `${candidate.displayName} (${candidate.providerName})`,
-  );
-  const modelLabels = new Map([...modelNames].map(([label, candidate]) => [candidate, label]));
-  const modelPlan = planned(
-    "model",
-    "model",
-    modelNames,
-    describeModel,
-    instructionsFor(
-      "Pick the AI coding model best suited to carry out this task. Use each model's description and the user's routing rules. Prefer cheaper, faster models for simple tasks and the strongest models for hard or open-ended ones.",
-      [],
-      args.instructions.models,
-    ),
-  );
-
-  // Asked once per model: the levels on offer and the right default both depend on it.
-  const reasoningPlan = (model: ModelCandidate) => {
-    const offered = args.reasoningFor(model).filter((level) => allowedLevels.has(level.level));
-    return planned(
-      `reasoning:${args.models.indexOf(model)}`,
-      "reasoning",
-      new Map(offered.map((level) => [level.level as string, level])),
-      (level) => level.description,
-      instructionsFor(
-        "Pick how much reasoning effort the model should spend on this task. Quick, mechanical, or clearly specified tasks need little. Ambiguous, multi-step, architectural, or high-stakes tasks need more. Follow the user's routing rules when they apply.",
-        [`The task will run on the model ${modelLabels.get(model) ?? model.displayName}.`],
-        args.instructions.models,
-      ),
-    );
-  };
-
   // Many projects share the same machines and environments, so they share one
   // machine question. The key is what Jev would see: who is on offer, and what
   // each can create.
-  const targetsCache = new Map<string, Targets>();
-  const targetsOf = (project: ProjectCandidate, model: ModelCandidate) => {
-    const cacheKey = `${project.id}\u0000${model.providerId}`;
-    let targets = targetsCache.get(cacheKey);
-    if (targets === undefined) {
-      targets = args.targetsFor(project, model);
-      targetsCache.set(cacheKey, targets);
-    }
-    return targets;
-  };
   const groupIds = new Map<string, number>();
   const groupId = (signature: string) => {
     let id = groupIds.get(signature);
@@ -574,21 +469,17 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
 
   // Fan out: everything that could matter, the widely shared questions first.
   fanout.add(projectPlan);
-  fanout.add(modelPlan);
-  for (const model of args.models) fanout.add(reasoningPlan(model));
   const speculative = new Map<string, { plan: Planned<unknown>; uses: number }>();
   for (const project of args.projects) {
-    for (const model of args.models) {
-      const targets = targetsOf(project, model);
-      const plans: Planned<unknown>[] = [
-        machinePlan(targets),
-        ...targets.machines.map((machine) => environmentPlan(machine, targets)),
-      ];
-      for (const plan of plans) {
-        const entry = speculative.get(plan.key);
-        if (entry === undefined) speculative.set(plan.key, { plan, uses: 1 });
-        else entry.uses += 1;
-      }
+    const targets = args.targetsFor(project);
+    const plans: Planned<unknown>[] = [
+      machinePlan(targets),
+      ...targets.machines.map((machine) => environmentPlan(machine, targets)),
+    ];
+    for (const plan of plans) {
+      const entry = speculative.get(plan.key);
+      if (entry === undefined) speculative.set(plan.key, { plan, uses: 1 });
+      else entry.uses += 1;
     }
   }
   for (const { plan } of [...speculative.values()].sort((a, b) => b.uses - a.uses)) {
@@ -599,29 +490,9 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
 
   // Keep the answers that apply.
   const project = await fanout.resolve(projectPlan);
-  const model = await fanout.resolve(modelPlan);
-
-  const levels = reasoningPlan(model.value);
-  let reasoning: Pick<ReasoningLevel>;
-  if (levels.named.size === 0) {
-    // Nothing to choose between: the rotation row's own level, unless the user
-    // has ruled that out too.
-    const fallback = model.value.reasoningLevel;
-    reasoning = reasoningPick(
-      allowedLevels.has(fallback)
-        ? fallback
-        : allowedLevels.has("medium")
-          ? "medium"
-          : (args.reasoningLevels[0] ?? fallback),
-    );
-  } else {
-    const picked = await fanout.resolve(levels);
-    reasoning = { ...picked, value: picked.value.level };
-  }
-
-  const targets = targetsOf(project.value, model.value);
+  const targets = args.targetsFor(project.value);
   if (targets.machines.length === 0 || targets.environments.length === 0) {
-    throw new RouteError(`No connected machine can run ${model.label} in ${project.label}.`);
+    throw new RouteError(`No connected machine can run a thread in ${project.label}.`);
   }
   const machine = await fanout.resolve(machinePlan(targets));
   const environments = environmentPlan(machine.value, targets);
@@ -632,11 +503,8 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
 
   return {
     project,
-    model,
     machine,
-    reasoning,
     environment,
-    share: null,
     latencyMs: Date.now() - startedAt,
   };
 }

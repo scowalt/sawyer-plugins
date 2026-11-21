@@ -17,7 +17,7 @@ import type { rpcContract } from "./server";
 import { registerSettings } from "./settings";
 import { magicMode } from "@/lib/magic-mode";
 import { findComposer } from "@/lib/composer-dom";
-import { selectionFor, shareNote } from "@/lib/fill";
+import { selectionFor } from "@/lib/fill";
 import type { LiveFillSnapshot } from "@/lib/live-fill";
 import { DEFAULT_PREFERENCES, type Preferences } from "@/lib/preferences";
 import { acquireSession, releaseSession, type Session } from "@/lib/session";
@@ -175,7 +175,6 @@ let lastKnownPreferences: Preferences | null = null;
 const NO_SESSION: LiveFillSnapshot = { enabled: false, pending: false, error: null };
 const getNoSession = () => NO_SESSION;
 const getNoCasts = () => 0;
-const getNoNote = () => null;
 const subscribeToNothing = () => () => {};
 
 /**
@@ -219,24 +218,18 @@ function MagicToggle() {
     return () => window.removeEventListener("focus", read);
   }, [rpc]);
   const { maySet, holdSend, pace } = known ?? DEFAULT_PREFERENCES;
-  const sets = `${maySet.project}${maySet.placement}${maySet.model}${maySet.effort}`;
-  const setsAnything = maySet.project || maySet.placement || maySet.model;
+  const sets = `${maySet.project}${maySet.placement}`;
+  const setsAnything = maySet.project || maySet.placement;
 
   const scope = view.scope;
   const projectId = scope.kind === "new-thread" ? scope.projectId : null;
   useLayoutEffect(() => {
     session?.attach({
-      route: async (text, draw) => {
+      route: async (text) => {
         // A project Magic Compose may not set is the one to route within.
         const pinned = maySet.project ? null : projectId;
-        const { decision } = await rpc.call("preview", {
-          text,
-          projectId: pinned,
-          // A share draw counts only where it sets the model.
-          draw: maySet.model ? draw : null,
-          anyMachine: !maySet.placement,
-        });
-        return { selection: selectionFor(decision, maySet), note: shareNote(decision, maySet) };
+        const { decision } = await rpc.call("preview", { text, projectId: pinned });
+        return selectionFor(decision, maySet);
       },
       setSelection: (selection) => composer.experimental_setSelection(selection),
     });
@@ -284,10 +277,6 @@ function MagicToggle() {
     session?.subscribeCasts ?? subscribeToNothing,
     session?.getCasts ?? getNoCasts,
   );
-  const shareNoteText = useSyncExternalStore(
-    session?.subscribeNote ?? subscribeToNothing,
-    session?.getNote ?? getNoNote,
-  );
   const castsAtMount = useRef<number | null>(null);
   if (session !== null && castsAtMount.current === null) castsAtMount.current = casts;
   const moves = casts - (castsAtMount.current ?? casts);
@@ -333,11 +322,9 @@ function MagicToggle() {
           <TooltipContent>
             {snapshot.error !== null
               ? `Magic Compose: ${snapshot.error}`
-              : enabled && shareNoteText !== null
-                ? shareNoteText
-                : enabled
-                  ? "Magic Compose is on: Jev picks where this runs as you type"
-                  : "Magic Compose: let Jev pick where this runs as you type"}
+              : enabled
+                ? "Magic Compose is on: Jev picks where this runs as you type"
+                : "Magic Compose: let Jev pick where this runs as you type"}
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
