@@ -74,6 +74,8 @@ const STATS_TIMEOUT_MS = 2_500;
 const USAGE_TIMEOUT_MS = 2_500;
 const USAGE_FRESH_MS = 3 * 60_000;
 const USAGE_STALE_MS = 15 * 60_000;
+/** How long a decision waits for a quota reading still loading once Jev has answered. */
+const USAGE_WAIT_MS = 1_000;
 const SHARE_DRAWS_KEPT = 500;
 const SHARE_DRAWS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATS_FRESH_MS = 15_000;
@@ -308,11 +310,9 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ entries: rotationSchema, share: shareRuleSchema.nullable() }).strict(),
   },
-  /** Replaces the entries and, when given, the random share (null turns it off). */
+  /** Replaces what it is given: the entries, the random share (null turns it off), or both. */
   rotation_set: {
-    input: z
-      .object({ entries: rotationSchema, share: shareRuleInputSchema.nullable().optional() })
-      .strict(),
+    input: rotationPatchSchema,
     output: z.object({ entries: rotationSchema, share: shareRuleSchema.nullable() }).strict(),
   },
   /** The scope, plus every project and environment it could include. */
@@ -913,6 +913,12 @@ export default async function plugin(bb: BbPluginApi) {
       profiler.time("load.machines", () => loadMachines()),
     ]);
     if (connected.length === 0) throw new RouteError("No machine is connected.");
+    // Jev has not picked a machine yet, so read every machine's quota while it decides.
+    const usageReads = sharePlan.then((plan) =>
+      plan === null
+        ? new Map<string, Promise<UsageReading>>()
+        : new Map(connected.map((entry) => [entry.id, readUsage(entry.id, plan.rule)] as const)),
+    );
     // A project checked out only on machines that are offline cannot run
     // anywhere right now, so it is not worth offering.
     const online = new Set(connected.map((entry) => entry.id));
@@ -1099,7 +1105,15 @@ export default async function plugin(bb: BbPluginApi) {
         // A target that cannot run here is skipped whatever its quota says.
         const gate =
           blocked === null
-            ? gateShare(rule, await readUsage(where.id, rule), Date.now())
+            ? gateShare(
+                rule,
+                await within(
+                  USAGE_WAIT_MS,
+                  (await usageReads).get(where.id) ?? readUsage(where.id, rule),
+                  { status: "unknown", reason: "the reading is still loading" },
+                ),
+                Date.now(),
+              )
             : { usage: "unknown" as const, odds: rule.share, note: "usage not checked" };
         const shared = applyShare({
           decision: jevDecision,
@@ -1267,9 +1281,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     rotation_get: async () => ({ entries: await readRotation(), share: await readShare() }),
     rotation_set: async ({ entries, share }) => {
-      await bb.storage.kv.set(ROTATION_KEY, entries);
+      if (entries !== undefined) await bb.storage.kv.set(ROTATION_KEY, entries);
       if (share !== undefined) await writeShare(share);
-      return { entries, share: await readShare() };
+      return { entries: await readRotation(), share: await readShare() };
     },
     scope_get: async () => {
       const [scope, projects, environments, hosts] = await Promise.all([

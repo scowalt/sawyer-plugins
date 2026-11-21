@@ -120,6 +120,11 @@ function createEntry(root: HTMLElement): Entry {
       setText(text) {
         // Seen before the live fill, which ignores an empty draft: it is what starts a new draw.
         draftDraw.forText(text);
+        if (text.trim() === "" && note !== null) {
+          // The decision it described went with the draft.
+          note = null;
+          for (const listener of [...noteListeners]) listener();
+        }
         live.setText(text);
       },
       attach(next) {

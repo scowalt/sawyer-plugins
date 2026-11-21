@@ -924,12 +924,12 @@ function ModelsSection() {
   const saveShare = useCallback(
     (next: ShareRule | null) => {
       setShare(next);
-      rpc.call("rotation_set", { entries: entries ?? [], share: next }).then(
+      rpc.call("rotation_set", { share: next }).then(
         () => setError(null),
         (cause) => setError(errorMessage(cause)),
       );
     },
-    [rpc, entries],
+    [rpc],
   );
 
   const addShare = useCallback(async () => {
