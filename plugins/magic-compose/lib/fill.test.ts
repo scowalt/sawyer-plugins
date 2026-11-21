@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DecisionSummary } from "../server";
-import { changedSelection, selectionFor } from "./fill";
+import { changedSelection, selectionFor, shareNote } from "./fill";
 
 const pick = (label: string) => ({
   label,
@@ -16,6 +16,7 @@ const decision: DecisionSummary = {
   model: { ...pick("Fable"), providerId: "claude-code", model: "fable" },
   reasoning: pick("max"),
   environment: { ...pick("Worktree"), id: "git-worktree" },
+  share: null,
   latencyMs: 300,
   timings: [],
 };
@@ -100,5 +101,49 @@ describe("changedSelection", () => {
       const next = selectionFor(moved, ALL);
       expect(changedSelection(first, next)).toEqual(next);
     }
+  });
+});
+
+describe("shareNote", () => {
+  const drawn: DecisionSummary = {
+    ...decision,
+    model: {
+      ...pick("Gemini 4 Neon (Google Antigravity)"),
+      source: "share",
+      providerId: "acp-antigravity-acp",
+      model: "gemini-4-neon",
+    },
+    share: {
+      target: {
+        providerId: "acp-antigravity-acp",
+        model: "gemini-4-neon",
+        label: "Gemini 4 Neon (Google Antigravity)",
+        reasoningLevel: "high",
+      },
+      base: 0.2,
+      odds: 0.2,
+      usage: "headroom",
+      note: "Gemini Models 5h 12%, weekly 30%",
+      outcome: "drawn",
+      draw: 0.05,
+      replaced: {
+        label: "Claude Opus 5.5 (Pi)",
+        providerId: "pi",
+        model: "claude-opus-5-5",
+        reasoning: "xhigh",
+      },
+    },
+  };
+
+  it("says the share chose the model, and what it replaced", () => {
+    expect(shareNote(drawn, ALL)).toBe(
+      "Magic Compose: Gemini 4 Neon (Google Antigravity) by random share, in place of Jev's Claude Opus 5.5 (Pi)",
+    );
+  });
+
+  it("says nothing when Jev's pick stands, or when the model is not Magic Compose's to set", () => {
+    expect(shareNote(decision, ALL)).toBeNull();
+    expect(shareNote({ ...drawn, share: { ...drawn.share!, outcome: "kept", replaced: null } }, ALL)).toBeNull();
+    expect(shareNote(drawn, { ...ALL, model: false, effort: false })).toBeNull();
   });
 });

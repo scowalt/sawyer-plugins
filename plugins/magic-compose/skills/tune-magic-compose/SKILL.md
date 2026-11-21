@@ -26,6 +26,15 @@ automations, and Magic Compose's own dispatches are left out. Add
 `--include-origin <plugin-id>` for another plugin whose threads the user starts
 by hand. Go back further (`--days 30`) if there are fewer than about 100 threads.
 
+Some threads may be **random share draws**: the user has Magic Compose send a
+share of new threads to one model at random, to compare it with their rotation.
+`history` reports them apart ("N threads were random share draws for <model>,
+replacing: …") and leaves them out of the counts, because the user did not
+choose them. In `--json`, such rows have a non-null `share`, and `shareDraws`
+totals them. Never treat the share's model as one of the user's choices: do not
+map it to a rotation model, do not add it to the rotation, and do not mention it
+in the model instructions or a note as a choice for Jev. Jev never sees it.
+
 Show the user the counts, then settle two things with them before going on, in
 one question if you can:
 
@@ -116,7 +125,8 @@ bb magic-compose backtest --days 14 \
   --exclude '<regex>' --json
 ```
 
-It routes each distinct past prompt with the current rotation and instructions
+It leaves share draws out (`skipped.shareDraw`), so a draw is never scored as
+a choice Jev got wrong. It routes each distinct past prompt with the current rotation and instructions
 and reports, for model and for effort, how often Jev agreed with the user, beside
 what always picking their favourite would score, plus confusion tables and up to
 80 disagreements. A few hundred prompts take about fifteen seconds and cost well
@@ -144,6 +154,9 @@ Tell the user, plainly:
   the baseline, and why the history limits them;
 - which judgment calls were yours rather than the history's;
 - where the previous settings were saved.
+
+Leave the random share as it is. It is set separately under Settings → Magic
+Compose → Models and effort, and `rotation set` with a bare array does not touch it.
 
 Spot-check a handful of fresh prompts with `bb magic-compose route "<prompt>"`
 before you finish. It starts nothing.

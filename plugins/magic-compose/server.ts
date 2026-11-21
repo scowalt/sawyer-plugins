@@ -3,6 +3,7 @@
 // OpenRouter, or OpenCode, then start the thread there. app.tsx owns the
 // composer toggle; this file gathers the candidates, asks Jev, and spawns.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { hostContract, machineStatsSchema } from "./contract";
 import {
@@ -17,11 +18,16 @@ import { jevTransport } from "./lib/transport";
 import { SwrCache } from "./lib/cache";
 import {
   backtestRows,
+  markShareDraws,
+  normalizePrompt,
   parseMapping,
   score,
+  SHARE_DRAW_PROMPT_CHARS,
+  shareTally,
   tally,
   type BacktestResult,
   type HistoryRow,
+  type ShareDraw,
 } from "./lib/history";
 import { formatSpans, Profiler } from "./lib/profile";
 import {
@@ -47,13 +53,48 @@ import {
   type RouteDecision,
   type Targets,
 } from "./lib/router";
+import {
+  applyShare,
+  DEFAULT_SHARE_USAGE,
+  firstKnownReading,
+  shareBlocked,
+  gateShare,
+  usageReadingFrom,
+  type ShareDecision,
+  type ShareRule,
+  type UsageReading,
+} from "./lib/share";
 
 const ROTATION_KEY = "rotation";
+const SHARE_KEY = "share";
+const SHARE_DRAWS_KEY = "shareDraws";
 const SCOPE_KEY = "scope";
 const PREFERENCES_KEY = "preferences";
 const MAX_ROTATION_ENTRIES = 24;
 const RECENT_TITLES_PER_PROJECT = 4;
 const STATS_TIMEOUT_MS = 2_500;
+/**
+ * The random share reads each machine's quota and the target's model list there.
+ * Both start before Jev answers and land in a cache for the next decision; a
+ * decision waits for them only briefly after Jev has answered. A cold read
+ * starts the agent, which takes seconds, and a hung one fails after about 15 s,
+ * so a read gets longer than that in the background.
+ */
+const SHARE_FACT_TIMEOUT_MS = 20_000;
+const SHARE_FACT_WAIT_MS = 1_000;
+const USAGE_FRESH_MS = 3 * 60_000;
+/**
+ * The last good quota reading is served, while a fresh one loads, for this
+ * long. A cold read never fits in a decision's wait, so a shorter limit would
+ * turn the first decision after a quiet spell into "usage unknown". Windows
+ * that have reset since the reading are left out of the gate.
+ */
+const USAGE_STALE_MS = 24 * 60 * 60_000;
+/** Listing a provider's models on a machine starts its agent, so the answer is kept a while. */
+const TARGET_CATALOG_FRESH_MS = 5 * 60_000;
+const TARGET_CATALOG_STALE_MS = 30 * 60_000;
+const SHARE_DRAWS_KEPT = 500;
+const SHARE_DRAWS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATS_FRESH_MS = 15_000;
 /** Which machines hold a project, and what each can create, rarely change. */
 const AVAILABILITY_FRESH_MS = 30_000;
@@ -96,6 +137,45 @@ const rotationEntrySchema = z
   .strict();
 const rotationSchema = z.array(rotationEntrySchema).max(MAX_ROTATION_ENTRIES);
 
+const shareUsageFields = {
+  sourceId: z.string().min(1).max(200),
+  group: z.string().min(1).max(200),
+  maxSessionPercent: z.number().gt(0).max(100),
+  maxWeeklyPercent: z.number().gt(0).max(100),
+};
+const shareRuleFields = {
+  providerId: z.string().min(1).max(200),
+  model: z.string().min(1).max(200),
+  reasoningLevel: z.enum(REASONING_LEVELS),
+  share: z.number().min(0).max(1),
+};
+/** A complete share rule, as stored and as shown. */
+export const shareRuleSchema = z
+  .object({ ...shareRuleFields, usage: z.object(shareUsageFields).strict() })
+  .strict();
+/**
+ * A share rule as set by hand: only the usage fields carry defaults, so a rule
+ * can name just its target, effort, and fraction.
+ */
+const shareRuleInputSchema = z
+  .object({
+    ...shareRuleFields,
+    usage: z
+      .object({
+        sourceId: shareUsageFields.sourceId.default(DEFAULT_SHARE_USAGE.sourceId),
+        group: shareUsageFields.group.default(DEFAULT_SHARE_USAGE.group),
+        maxSessionPercent: shareUsageFields.maxSessionPercent.default(
+          DEFAULT_SHARE_USAGE.maxSessionPercent,
+        ),
+        maxWeeklyPercent: shareUsageFields.maxWeeklyPercent.default(
+          DEFAULT_SHARE_USAGE.maxWeeklyPercent,
+        ),
+      })
+      .strict()
+      .default(DEFAULT_SHARE_USAGE),
+  })
+  .strict();
+
 // Which projects, environments, and effort levels Magic Compose may choose between.
 const scopeSchema = z
   .object({
@@ -127,10 +207,39 @@ const DEFAULT_SCOPE: Scope = {
 const pickSchema = z
   .object({
     label: z.string(),
-    source: z.enum(["jev", "only-option", "fallback"]),
+    source: z.enum(["jev", "only-option", "fallback", "share"]),
     probability: z.number().nullable(),
     confidence: z.number().nullable(),
     alternatives: z.array(z.object({ label: z.string(), probability: z.number() }).strict()),
+  })
+  .strict();
+
+const shareSummarySchema = z
+  .object({
+    target: z
+      .object({
+        providerId: z.string(),
+        model: z.string(),
+        label: z.string(),
+        reasoningLevel: z.string(),
+      })
+      .strict(),
+    base: z.number(),
+    odds: z.number(),
+    usage: z.enum(["headroom", "scaled", "unknown", "over"]),
+    note: z.string(),
+    outcome: z.enum(["drawn", "kept", "skipped"]),
+    draw: z.number().nullable(),
+    /** What Jev had picked, when the share replaced it. */
+    replaced: z
+      .object({
+        label: z.string(),
+        providerId: z.string(),
+        model: z.string(),
+        reasoning: z.string(),
+      })
+      .strict()
+      .nullable(),
   })
   .strict();
 
@@ -141,6 +250,8 @@ const decisionSchema = z
     model: pickSchema.extend({ providerId: z.string(), model: z.string() }),
     reasoning: pickSchema,
     environment: pickSchema.extend({ id: z.string() }),
+    /** Null when no random share is set up. */
+    share: shareSummarySchema.nullable(),
     latencyMs: z.number(),
     /** Where the time went; overlapping spans ran in parallel. */
     timings: z.array(
@@ -149,6 +260,10 @@ const decisionSchema = z
   })
   .strict();
 export type DecisionSummary = z.infer<typeof decisionSchema>;
+
+const rotationPatchSchema = z
+  .object({ entries: rotationSchema.optional(), share: shareRuleInputSchema.nullable().optional() })
+  .strict();
 
 const promptSchema = z.string().trim().min(1).max(200_000);
 
@@ -210,11 +325,12 @@ export const rpcContract = defineRpcContract({
   },
   rotation_get: {
     input: z.null(),
-    output: z.object({ entries: rotationSchema }).strict(),
+    output: z.object({ entries: rotationSchema, share: shareRuleSchema.nullable() }).strict(),
   },
+  /** Replaces what it is given: the entries, the random share (null turns it off), or both. */
   rotation_set: {
-    input: z.object({ entries: rotationSchema }).strict(),
-    output: z.object({ entries: rotationSchema }).strict(),
+    input: rotationPatchSchema,
+    output: z.object({ entries: rotationSchema, share: shareRuleSchema.nullable() }).strict(),
   },
   /** The scope, plus every project and environment it could include. */
   scope_get: {
@@ -248,6 +364,17 @@ export const rpcContract = defineRpcContract({
         text: promptSchema,
         /** Route within this project only, for a composer whose project Magic Compose may not set. */
         projectId: z.string().min(1).nullable().default(null),
+        /**
+         * The random share's draw, one per draft, so the answer holds while the
+         * user types. Given only by a composer that may set the model, and a
+         * drawn answer is then remembered for `history`.
+         */
+        draw: z.number().min(0).lt(1).nullable().default(null),
+        /**
+         * The composer keeps its own machine, so the share may land on any
+         * machine the project could run on, and must be able to start on each.
+         */
+        anyMachine: z.boolean().default(false),
       })
       .strict(),
     output: z.object({ decision: decisionSchema }).strict(),
@@ -292,8 +419,55 @@ function summarizePick<T>(pick: Pick<T>): z.infer<typeof pickSchema> {
   };
 }
 
+function summarizeShare(share: ShareDecision | null): DecisionSummary["share"] {
+  if (share === null) return null;
+  const { result } = share;
+  const replaced = result.outcome === "drawn" ? result.replaced : null;
+  return {
+    target: {
+      providerId: share.target.providerId,
+      model: share.target.model,
+      label: `${share.target.displayName} (${share.target.providerName})`,
+      reasoningLevel: share.target.reasoningLevel,
+    },
+    base: share.base,
+    odds: share.odds,
+    usage: share.usage,
+    note: share.note,
+    outcome: result.outcome,
+    draw: result.outcome === "skipped" ? null : result.draw,
+    replaced:
+      replaced === null
+        ? null
+        : {
+            label: replaced.model.label,
+            providerId: replaced.model.value.providerId,
+            model: replaced.model.value.model,
+            reasoning: replaced.reasoning.value,
+          },
+  };
+}
+
 function formatPercent(value: number | null): string {
   return value === null ? "" : ` ${Math.round(value * 100)}%`;
+}
+
+function formatShareRule(rule: ShareRule): string {
+  return [
+    `Random share: ${Math.round(rule.share * 100)}% of new threads to ${rule.providerId} / ${rule.model} at ${rule.reasoningLevel}, after Jev picks`,
+    `  only while ${rule.usage.group} (${rule.usage.sourceId}) is under ${rule.usage.maxSessionPercent}% of its 5h window and ${rule.usage.maxWeeklyPercent}% of its weekly one`,
+  ].join("\n");
+}
+
+function formatShare(share: NonNullable<DecisionSummary["share"]>): string {
+  const odds = `${Math.round(share.odds * 100)}%`;
+  const what =
+    share.outcome === "drawn" && share.replaced !== null
+      ? `drawn: ${share.target.label} ${share.target.reasoningLevel} at ${odds} odds, replacing ${share.replaced.label} ${share.replaced.reasoning}`
+      : share.outcome === "kept"
+        ? `not drawn (${odds} odds)`
+        : "skipped:";
+  return `${"Share".padEnd(12)}${what}${share.outcome === "skipped" ? " " : " · "}${share.note}`;
 }
 
 function formatDecision(decision: DecisionSummary): string {
@@ -301,7 +475,9 @@ function formatDecision(decision: DecisionSummary): string {
     const how =
       pick.source === "only-option"
         ? " (only option)"
-        : `${formatPercent(pick.probability)}${pick.source === "fallback" ? " (fallback)" : ""}`;
+        : pick.source === "share"
+          ? " (share)"
+          : `${formatPercent(pick.probability)}${pick.source === "fallback" ? " (fallback)" : ""}`;
     const others = pick.alternatives
       .filter((alternative) => alternative.probability >= 0.05)
       .map((alternative) => `${alternative.label}${formatPercent(alternative.probability)}`)
@@ -314,6 +490,7 @@ function formatDecision(decision: DecisionSummary): string {
     line("Model", decision.model),
     line("Reasoning", decision.reasoning),
     line("Environment", decision.environment),
+    ...(decision.share === null ? [] : [formatShare(decision.share)]),
     `Decided in ${decision.latencyMs}ms`,
   ].join("\n");
 }
@@ -376,6 +553,16 @@ export default async function plugin(bb: BbPluginApi) {
   async function readRotation(): Promise<RotationEntry[]> {
     const parsed = rotationSchema.safeParse(await bb.storage.kv.get(ROTATION_KEY));
     return parsed.success ? parsed.data : [];
+  }
+
+  async function readShare(): Promise<ShareRule | null> {
+    const parsed = shareRuleSchema.safeParse(await bb.storage.kv.get(SHARE_KEY));
+    return parsed.success ? parsed.data : null;
+  }
+
+  async function writeShare(rule: ShareRule | null): Promise<void> {
+    if (rule === null) await bb.storage.kv.delete(SHARE_KEY);
+    else await bb.storage.kv.set(SHARE_KEY, rule);
   }
 
   async function readScope(): Promise<Scope> {
@@ -444,6 +631,75 @@ export default async function plugin(bb: BbPluginApi) {
     AVAILABILITY_FRESH_MS,
     SERVE_STALE_MS,
   );
+
+  const hostKey = (hostId: string, id: string) => `${hostId}\u0000${id}`;
+  /** The failure last logged per machine and source, so one that persists is logged once. */
+  const loggedUsageFailures = new Map<string, string>();
+  const logUsageFailure = (key: string, hostId: string, reason: string) => {
+    if (loggedUsageFailures.get(key) === reason) return;
+    loggedUsageFailures.set(key, reason);
+    bb.log.warn(`quota read failed on ${hostId}: ${reason}`);
+  };
+  const usageCache = new SwrCache<UsageReading>(
+    async (key) => {
+      const [hostId = "", sourceId = ""] = key.split("\u0000");
+      let response: Record<string, unknown>;
+      try {
+        response = await withTimeout(
+          (signal) => bb.sdk.system.usageLimits({ hostId, providerId: sourceId, signal }),
+          SHARE_FACT_TIMEOUT_MS,
+        );
+      } catch (error) {
+        logUsageFailure(key, hostId, messageOf(error));
+        throw error;
+      }
+      const reading = usageReadingFrom(sourceId, response);
+      if (reading.status === "unknown") {
+        // A machine without the source is expected; a source that failed is news.
+        if (sourceId in response) logUsageFailure(key, hostId, reading.reason);
+        // Not cached: the last good reading stays, and the next decision asks again.
+        throw new Error(reading.reason);
+      }
+      loggedUsageFailures.delete(key);
+      return { ...reading, readAt: Date.now() };
+    },
+    USAGE_FRESH_MS,
+    USAGE_STALE_MS,
+  );
+
+  /** What the source says the share's quota group has used. A failed read is unknown, not empty. */
+  async function readUsage(hostId: string, rule: ShareRule): Promise<UsageReading> {
+    try {
+      return await usageCache.get(hostKey(hostId, rule.usage.sourceId));
+    } catch (error) {
+      return { status: "unknown", reason: messageOf(error) };
+    }
+  }
+
+  // Per machine, because a provider can be listed everywhere yet start only
+  // where its agent is installed: its model list on a machine without the
+  // agent carries a `modelLoadError`.
+  const targetCatalogCache = new SwrCache<ModelCatalog>(
+    (key) => {
+      const [hostId = "", providerId = ""] = key.split("\u0000");
+      return withTimeout(
+        (signal) => bb.sdk.providers.models({ providerId, hostId, signal }),
+        SHARE_FACT_TIMEOUT_MS,
+      );
+    },
+    TARGET_CATALOG_FRESH_MS,
+    TARGET_CATALOG_STALE_MS,
+  );
+
+  /** The share target's models as `hostId` lists them, or null when they could not be read. */
+  async function readTargetCatalog(hostId: string, providerId: string): Promise<ModelCatalog | null> {
+    try {
+      return await targetCatalogCache.get(hostKey(hostId, providerId));
+    } catch (error) {
+      bb.log.warn(`model catalog unavailable for ${providerId} on ${hostId}: ${messageOf(error)}`);
+      return null;
+    }
+  }
 
   async function machineStats(hostId: string): Promise<MachineStats | null> {
     try {
@@ -547,6 +803,32 @@ export default async function plugin(bb: BbPluginApi) {
     return { models, catalogs };
   }
 
+  /** The share rule, or null when there is no share to apply. Never rejects. */
+  async function readActiveShare(): Promise<ShareRule | null> {
+    try {
+      const rule = await readShare();
+      return rule === null || rule.share <= 0 ? null : rule;
+    } catch (error) {
+      bb.log.warn(`could not read the random share: ${messageOf(error)}`);
+      return null;
+    }
+  }
+
+  /** The share target as a model candidate, named from `catalog` when it has the names. */
+  function shareTarget(rule: ShareRule, catalog: ModelCatalog | null): ModelCandidate {
+    const model = catalog?.models.find((candidate) => candidate.model === rule.model);
+    const provider = catalog?.providers.find((candidate) => candidate.id === rule.providerId);
+    return {
+      providerId: rule.providerId,
+      model: rule.model,
+      note: "",
+      reasoningLevel: rule.reasoningLevel,
+      providerName: provider?.displayName ?? rule.providerId,
+      displayName: model?.displayName ?? rule.model,
+      description: model?.description ?? "",
+    };
+  }
+
   interface RoutedThread {
     decision: RouteDecision;
     profiler: Profiler;
@@ -562,6 +844,54 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
+  const shareDrawSchema = z.object({
+    key: z.string(),
+    at: z.number(),
+    prompt: z.string(),
+    target: z.object({ providerId: z.string(), model: z.string() }),
+    replaced: z.object({ providerId: z.string(), model: z.string(), effort: z.string() }),
+  });
+
+  async function readShareDraws(): Promise<ShareDraw[]> {
+    const parsed = z.array(shareDrawSchema).safeParse(await bb.storage.kv.get(SHARE_DRAWS_KEY));
+    return parsed.success ? parsed.data : [];
+  }
+
+  /** Writes queue behind each other, so two decisions at once keep both draws. */
+  let shareDrawsWrite: Promise<void> = Promise.resolve();
+
+  /**
+   * Remember a draw, so `history` can tell the thread it started from the ones
+   * the user chose. One entry per `key`: a draft routed again as it grows
+   * replaces its own. A failed write is logged and never fails the route.
+   */
+  function recordShareDraw(text: string, share: ShareDecision | null, key: string): void {
+    const result = share?.result;
+    if (share === null || result?.outcome !== "drawn") return;
+    const entry: ShareDraw = {
+      key,
+      at: Date.now(),
+      prompt: normalizePrompt(text).slice(0, SHARE_DRAW_PROMPT_CHARS),
+      target: { providerId: share.target.providerId, model: share.target.model },
+      replaced: {
+        providerId: result.replaced.model.value.providerId,
+        model: result.replaced.model.value.model,
+        effort: result.replaced.reasoning.value,
+      },
+    };
+    shareDrawsWrite = shareDrawsWrite.then(async () => {
+      try {
+        const cutoff = Date.now() - SHARE_DRAWS_MAX_AGE_MS;
+        const kept = (await readShareDraws()).filter(
+          (draw) => draw.key !== key && draw.at >= cutoff,
+        );
+        await bb.storage.kv.set(SHARE_DRAWS_KEY, [...kept, entry].slice(-SHARE_DRAWS_KEPT));
+      } catch (error) {
+        bb.log.warn(`could not record the share draw: ${messageOf(error)}`);
+      }
+    });
+  }
+
   /** How the last question to Jev went, for the settings page. Not kept across loads. */
   let lastAsked: { at: number; latencyMs: number | null; error: string | null } | null = null;
 
@@ -570,9 +900,30 @@ export default async function plugin(bb: BbPluginApi) {
    * only, whether or not it is one Magic Compose may choose: that is for a composer
    * whose project Magic Compose has been told to leave alone.
    */
-  async function decide(text: string, projectId: string | null = null): Promise<RoutedThread> {
+  async function decide(
+    text: string,
+    options: {
+      projectId?: string | null;
+      draw?: number;
+      /**
+       * Remember a drawn share under this key, for a decision a thread will
+       * start from. Left out for a look that starts nothing (`route`, Try it),
+       * so `history` never takes a thread the user chose for a draw.
+       */
+      recordAs?: string;
+      anyMachine?: boolean;
+    } = {},
+  ): Promise<RoutedThread> {
     try {
-      const routed = await decideWithin(text, projectId);
+      const routed = await decideWithin(
+        text,
+        options.projectId ?? null,
+        options.draw ?? Math.random(),
+        options.anyMachine ?? false,
+      );
+      if (options.recordAs !== undefined) {
+        recordShareDraw(text, routed.decision.share, options.recordAs);
+      }
       lastAsked = { at: Date.now(), latencyMs: routed.profiler.elapsed(), error: null };
       return routed;
     } catch (error) {
@@ -581,8 +932,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function decideWithin(text: string, projectId: string | null): Promise<RoutedThread> {
+  async function decideWithin(
+    text: string,
+    projectId: string | null,
+    draw: number,
+    anyMachine: boolean,
+  ): Promise<RoutedThread> {
     const profiler = new Profiler();
+    // Read alongside everything else, so the share adds no wait of its own.
+    const activeShare = readActiveShare();
     const config = await profiler.time("settings", () => readConfig());
     const routes = await profiler.time("settings.keys", () => jevRoutes());
     if (routes.length === 0) {
@@ -611,6 +969,24 @@ export default async function plugin(bb: BbPluginApi) {
       profiler.time("load.machines", () => loadMachines()),
     ]);
     if (connected.length === 0) throw new RouteError("No machine is connected.");
+    // Jev has not picked a machine yet, so read every machine's quota and the
+    // target's models there while it decides.
+    const shareReads = activeShare.then((rule) =>
+      rule === null
+        ? null
+        : new Map(
+            connected.map(
+              (entry) =>
+                [
+                  entry.id,
+                  {
+                    usage: readUsage(entry.id, rule),
+                    catalog: readTargetCatalog(entry.id, rule.providerId),
+                  },
+                ] as const,
+            ),
+          ),
+    );
     // A project checked out only on machines that are offline cannot run
     // anywhere right now, so it is not worth offering.
     const online = new Set(connected.map((entry) => entry.id));
@@ -784,9 +1160,93 @@ export default async function plugin(bb: BbPluginApi) {
     const usedFallbackEnvironment = chosenTargets.usedFallback;
     const inputsByEnvironment = chosenTargets.inputs;
 
-    const decision: RouteDecision = usedFallbackEnvironment
+    const jevDecision: RouteDecision = usedFallbackEnvironment
       ? { ...routed, environment: { ...routed.environment, source: "fallback" } }
       : routed;
+    const decision = await profiler.time("share", async () => {
+      const rule = await activeShare;
+      if (rule === null) return jevDecision;
+      const where = jevDecision.machine.value;
+      let target = shareTarget(rule, null);
+      try {
+        // Where the thread may run: Jev's machine, or, for a composer that keeps
+        // its own, any machine Jev could have picked.
+        const places =
+          anyMachine && chosenTargets.machines.length > 0 ? chosenTargets.machines : [where];
+        const reads = await shareReads;
+        const checks = await Promise.all(
+          places.map(async (machine) => {
+            const read = reads?.get(machine.id) ?? {
+              usage: readUsage(machine.id, rule),
+              catalog: readTargetCatalog(machine.id, rule.providerId),
+            };
+            const catalog = await within(SHARE_FACT_WAIT_MS, read.catalog, undefined);
+            const blocked = shareBlocked(
+              shareTarget(rule, catalog ?? null),
+              machine,
+              providersByHost.get(machine.id),
+              catalog,
+            );
+            return { read, catalog, blocked };
+          }),
+        );
+        const named =
+          checks.find((check) => check.catalog?.models.some((entry) => entry.model === rule.model))
+            ?.catalog ?? null;
+        target = shareTarget(rule, named);
+        const blocked = checks.find((check) => check.blocked !== null)?.blocked ?? null;
+        // Any connected machine's reading will do, the thread's own first.
+        const usageReads = [
+          ...checks.map((check) => check.read.usage),
+          ...[...(reads?.values() ?? [])].map((read) => read.usage),
+        ];
+        // A target that cannot run here is skipped whatever its quota says.
+        const gate =
+          blocked === null
+            ? gateShare(
+                rule,
+                firstKnownReading(
+                  await Promise.all(
+                    usageReads.map((usage) =>
+                      within(SHARE_FACT_WAIT_MS, usage, {
+                        status: "unknown" as const,
+                        reason: "the reading is still loading",
+                      }),
+                    ),
+                  ),
+                ),
+                Date.now(),
+              )
+            : { usage: "unknown" as const, odds: rule.share, note: "usage not checked" };
+        const shared = applyShare({
+          decision: jevDecision,
+          target,
+          base: rule.share,
+          gate,
+          blocked,
+          draw,
+        });
+        // So the permission mode below is limited by the provider that will run.
+        if (shared.share?.result.outcome === "drawn" && named !== null) {
+          catalogs.set(rule.providerId, named);
+        }
+        return shared;
+      } catch (error) {
+        bb.log.warn(`random share failed: ${messageOf(error)}`);
+        const reason = `share failed: ${messageOf(error)}`;
+        return {
+          ...jevDecision,
+          share: {
+            target,
+            base: rule.share,
+            odds: 0,
+            usage: "unknown" as const,
+            note: reason,
+            result: { outcome: "skipped" as const, reason },
+          },
+        };
+      }
+    });
 
     // A thread may not ask for more than its machine or provider grants, so
     // take the most permissive mode at or below both the setting and the ceiling.
@@ -807,7 +1267,10 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       decision,
       profiler,
-      environmentInputs: inputsByEnvironment.get(decision.environment.value.id) ?? {},
+      // Null for a provider that takes no inputs, which `?? {}` would turn into some.
+      environmentInputs: inputsByEnvironment.has(decision.environment.value.id)
+        ? (inputsByEnvironment.get(decision.environment.value.id) ?? null)
+        : {},
       permissionMode,
     };
   }
@@ -824,6 +1287,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       reasoning: summarizePick(decision.reasoning),
       environment: { ...summarizePick(decision.environment), id: decision.environment.value.id },
+      share: summarizeShare(decision.share),
       latencyMs: routed.profiler.elapsed(),
       timings: [...routed.profiler.spans],
     };
@@ -836,9 +1300,12 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Route `text` and start the thread there. What `bb magic-compose spawn` runs. */
-  async function dispatch(text: string): Promise<{ threadId: string; decision: DecisionSummary }> {
+  async function dispatch(
+    text: string,
+    draw?: number,
+  ): Promise<{ threadId: string; decision: DecisionSummary }> {
     try {
-      const routed = await decide(text);
+      const routed = await decide(text, { draw, recordAs: randomUUID() });
       const summary = summarize(routed);
       const projectId = summary.project.id;
       const thread = await routed.profiler.time("threads.spawn", () => bb.sdk.threads.spawn({
@@ -899,9 +1366,10 @@ export default async function plugin(bb: BbPluginApi) {
     warm: async () => {
       const routes = await jevRoutes();
       if (routes.length === 0) return { warmed: false };
-      const [{ connected }, projects] = await Promise.all([
+      const [{ connected }, projects, share] = await Promise.all([
         loadMachines(),
         bb.sdk.projects.list({ includePersonal: true }),
+        readShare(),
         warmRoutes(routes),
       ]);
       // Refreshed, not just read, so a dispatch in the next moments finds them fresh.
@@ -911,13 +1379,22 @@ export default async function plugin(bb: BbPluginApi) {
           hostProvidersCache.refresh(entry.id),
         ]),
         ...projects.map((project) => environmentsCache.refresh(project.id)),
+        ...(share === null || share.share <= 0
+          ? []
+          : // Read, not refreshed: listing the target's models starts its agent, and
+            // warming comes as often as every 20 s.
+            connected.flatMap((entry) => [
+              usageCache.get(hostKey(entry.id, share.usage.sourceId)),
+              targetCatalogCache.get(hostKey(entry.id, share.providerId)),
+            ])),
       ]);
       return { warmed: true };
     },
-    rotation_get: async () => ({ entries: await readRotation() }),
-    rotation_set: async ({ entries }) => {
-      await bb.storage.kv.set(ROTATION_KEY, entries);
-      return { entries };
+    rotation_get: async () => ({ entries: await readRotation(), share: await readShare() }),
+    rotation_set: async ({ entries, share }) => {
+      if (entries !== undefined) await bb.storage.kv.set(ROTATION_KEY, entries);
+      if (share !== undefined) await writeShare(share);
+      return { entries: await readRotation(), share: await readShare() };
     },
     scope_get: async () => {
       const [scope, projects, environments, hosts] = await Promise.all([
@@ -971,9 +1448,14 @@ export default async function plugin(bb: BbPluginApi) {
         },
       };
     },
-    preview: async ({ text, projectId }) => {
+    preview: async ({ text, projectId, draw, anyMachine }) => {
       try {
-        return { decision: summarize(await decide(text, projectId)) };
+        // A draft's draw doubles as its key, so routing it again replaces its own log entry.
+        const routed = await decide(
+          text,
+          draw === null ? { projectId, anyMachine } : { projectId, anyMachine, draw, recordAs: String(draw) },
+        );
+        return { decision: summarize(routed) };
       } catch (error) {
         throw userFacing(error);
       }
@@ -1012,8 +1494,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function loadHistory(days: number, extraOrigins: readonly string[]): Promise<HistoryRow[]> {
     const userOrigins = new Set([...COMPOSER_PLUGINS, ...extraOrigins]);
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    const [projects, threads] = await Promise.all([
+    const [projects, draws, threads] = await Promise.all([
       bb.sdk.projects.list({ includePersonal: true }),
+      readShareDraws(),
       (async () => {
         const all: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
         for (let offset = 0; ; offset += 500) {
@@ -1057,17 +1540,21 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: thread.providerId,
           model,
           effort: reasoningLevel,
-          prompt: (turn.data.input ?? [])
-            .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
-            .join(" ")
-            .replace(/\s+/gu, " ")
-            .trim(),
+          prompt: normalizePrompt(
+            (turn.data.input ?? [])
+              .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+              .join(" "),
+          ),
+          share: null,
         };
       } catch {
         return null;
       }
     });
-    return rows.filter((entry) => entry !== null);
+    return markShareDraws(
+      rows.filter((entry) => entry !== null),
+      draws,
+    );
   }
 
   /**
@@ -1136,7 +1623,7 @@ export default async function plugin(bb: BbPluginApi) {
     return results.filter((entry) => entry !== null);
   }
 
-  const VALUE_FLAGS = new Set(["--days", "--map", "--exclude", "--limit", "--include-origin"]);
+  const VALUE_FLAGS = new Set(["--days", "--map", "--exclude", "--limit", "--include-origin", "--draw"]);
   function parseArgs(argv: readonly string[]) {
     const values = new Map<string, string[]>();
     const switches = new Set<string>();
@@ -1155,11 +1642,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   const usage = [
     "Usage:",
-    "  bb magic-compose route <prompt> [--json] [--profile]   Show where Jev would send a prompt; starts nothing",
-    "  bb magic-compose spawn <prompt> [--json]   Route a prompt and start the thread",
+    "  bb magic-compose route <prompt> [--json] [--profile] [--draw <0..1>]   Show where Jev would send a prompt; starts nothing",
+    "  bb magic-compose spawn <prompt> [--json] [--draw <0..1>]   Route a prompt and start the thread",
+    "                                             --draw fixes the random share's draw: 0 forces it whenever its odds are above 0",
     "  bb magic-compose machines [--json]         Show what Jev is told about each connected machine",
-    "  bb magic-compose rotation get [--json]     Show the model rotation",
-    "  bb magic-compose rotation set <json>       Replace it: [{providerId, model, note, reasoningLevel}, ...]",
+    "  bb magic-compose rotation get [--json]     Show the model rotation and the random share",
+    "  bb magic-compose rotation set <json>       An array replaces the rotation: [{providerId, model, note, reasoningLevel}, ...]",
+    "                                             An object replaces what it names: {entries: [...], share: {providerId, model, reasoningLevel, share, usage?} | null}",
     "  bb magic-compose preferences get [--json]  Show the instructions and the other preferences",
     "  bb magic-compose preferences set <key> <value>   Set one, for example modelInstructions",
     "  bb magic-compose history [--days 14] [--include-origin <plugin-id>]... [--json]",
@@ -1174,12 +1663,12 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "route",
         summary: "Show where Jev would send a prompt, without starting a thread",
-        usage: "bb magic-compose route <prompt> [--json]",
+        usage: "bb magic-compose route <prompt> [--json] [--draw <0..1>]",
       },
       {
         name: "spawn",
         summary: "Route a prompt with Jev and start the thread there",
-        usage: "bb magic-compose spawn <prompt> [--json]",
+        usage: "bb magic-compose spawn <prompt> [--json] [--draw <0..1>]",
       },
       {
         name: "machines",
@@ -1188,7 +1677,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "rotation",
-        summary: "Show or replace the model rotation",
+        summary: "Show or replace the model rotation and the random share",
         usage: "bb magic-compose rotation get [--json] | rotation set <json>",
       },
       {
@@ -1230,26 +1719,43 @@ export default async function plugin(bb: BbPluginApi) {
         if (action === "set") {
           try {
             const raw: unknown = JSON.parse(payload.join(" "));
-            const entries = rotationSchema.parse(
-              Array.isArray(raw) ? raw : (raw as { entries?: unknown }).entries,
-            );
-            await bb.storage.kv.set(ROTATION_KEY, entries);
-            return { exitCode: 0, stdout: `Rotation set to ${entries.length} model(s).` };
+            const patch = rotationPatchSchema.parse(Array.isArray(raw) ? { entries: raw } : raw);
+            if (patch.entries === undefined && patch.share === undefined) {
+              throw new Error("give an array of models, or an object with entries and/or share");
+            }
+            const done: string[] = [];
+            if (patch.entries !== undefined) {
+              await bb.storage.kv.set(ROTATION_KEY, patch.entries);
+              done.push(`Rotation set to ${patch.entries.length} model(s).`);
+            }
+            if (patch.share !== undefined) {
+              await writeShare(patch.share);
+              done.push(
+                patch.share === null
+                  ? "Random share turned off."
+                  : `Random share set to ${Math.round(patch.share.share * 100)}% for ${patch.share.providerId} / ${patch.share.model}.`,
+              );
+            }
+            return { exitCode: 0, stdout: done.join("\n") };
           } catch (error) {
             return { exitCode: 1, stderr: `Could not read the rotation: ${messageOf(error)}` };
           }
         }
         if (action !== undefined && action !== "get") return { exitCode: 1, stderr: usage };
         const entries = await readRotation();
+        const share = await readShare();
         return {
           exitCode: 0,
           stdout: json
-            ? JSON.stringify(entries)
-            : entries.length === 0
-              ? "The rotation is empty."
-              : entries
-                  .map((entry) => `${entry.providerId} / ${entry.model} (fallback effort ${entry.reasoningLevel})\n  ${entry.note || "(no note)"}`)
-                  .join("\n"),
+            ? JSON.stringify({ entries, share })
+            : [
+                entries.length === 0
+                  ? "The rotation is empty."
+                  : entries
+                      .map((entry) => `${entry.providerId} / ${entry.model} (fallback effort ${entry.reasoningLevel})\n  ${entry.note || "(no note)"}`)
+                      .join("\n"),
+                share === null ? "Random share: off" : formatShareRule(share),
+              ].join("\n"),
         };
       }
       if (command === "preferences") {
@@ -1297,6 +1803,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (command === "history") {
         const rows = await loadHistory(days, values.get("--include-origin") ?? []);
         const counts = tally(rows);
+        const drawn = shareTally(rows);
         if (json) {
           return {
             exitCode: 0,
@@ -1304,6 +1811,7 @@ export default async function plugin(bb: BbPluginApi) {
               days,
               threads: rows.length,
               counts,
+              shareDraws: { total: drawn.total, replaced: drawn.replaced },
               rows: rows.map((row) => ({ ...row, prompt: row.prompt.slice(0, HISTORY_PROMPT_CHARS) })),
             }),
           };
@@ -1311,7 +1819,7 @@ export default async function plugin(bb: BbPluginApi) {
         return {
           exitCode: 0,
           stdout: [
-            `${rows.length} threads you started in the last ${days} days:`,
+            `${rows.length - drawn.total} threads you started in the last ${days} days:`,
             ...counts.map(
               (entry) =>
                 `  ${entry.model.padEnd(28)} ${String(entry.total).padStart(4)}   ${Object.entries(entry.efforts)
@@ -1319,6 +1827,14 @@ export default async function plugin(bb: BbPluginApi) {
                   .map(([effort, count]) => `${effort} ${count}`)
                   .join(", ")}`,
             ),
+            ...(drawn.total === 0
+              ? []
+              : [
+                  `${drawn.total} threads were random share draws for ${drawn.models.join(", ")}, replacing: ${Object.entries(drawn.replaced)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([replaced, count]) => `${replaced} ${count}`)
+                    .join(", ")}`,
+                ]),
             "Add --json for every thread's prompt, model, and effort.",
           ].join("\n"),
         };
@@ -1376,15 +1892,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (command !== "route" && command !== "spawn") return { exitCode: 1, stderr: usage };
       const prompt = promptSchema.safeParse(rest.join(" "));
       if (!prompt.success) return { exitCode: 1, stderr: usage };
+      const drawText = values.get("--draw")?.[0];
+      const draw = drawText === undefined ? undefined : Number(drawText);
+      if (draw !== undefined && !(draw >= 0 && draw < 1)) {
+        return { exitCode: 1, stderr: "--draw takes a number from 0 up to, but not including, 1." };
+      }
       try {
         if (command === "route") {
-          const decision = summarize(await decide(prompt.data));
+          const decision = summarize(await decide(prompt.data, { draw }));
           return {
             exitCode: 0,
             stdout: json ? JSON.stringify(decision) : formatDecision(decision) + timeline(decision),
           };
         }
-        const parsed = await dispatch(prompt.data);
+        const parsed = await dispatch(prompt.data, draw);
         return {
           exitCode: 0,
           stdout: json

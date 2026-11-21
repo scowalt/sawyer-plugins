@@ -51,6 +51,10 @@ Machine details come from a small host entry that runs on each enrolled machine 
 
 A thread started with `bb magic-compose spawn` keeps its decision, with probabilities, in its plugin metadata.
 
+### The random share
+
+Under Settings → Models and effort you can set a random share: a fraction of new threads (say 20%) that goes to one more model at random, after Jev picks, so you can compare that model with your rotation on real work. Jev never sees it as an option. The share follows the model's quota group, read through a provider usage source (by default `usage-pace-antigravity` and its "Gemini Models" group): no draw while the 5-hour window is at or above 85% or the weekly window at or above 90%, and a weekly pace above 1× scales the share down by that pace. A reading that is missing or signed out counts as unknown, never as 0%, and draws at the base share. Every decision records this state, and a draw records what Jev had picked: see `share` in `route --json`, "Try it", and the composer wand's tooltip. `history` counts drawn threads apart from your own choices, and `backtest` skips them.
+
 ### Keeping it fast
 
 The facts code needs — what each machine is doing, which providers it runs, which environments it can create for each project — are cached and refreshed behind the scenes, so a dispatch never waits on a slow machine. Jev is reached over one long-lived HTTP/2 connection per gateway rather than a new connection per call: the first request on a new connection takes a second or more, and Node drops idle connections after four seconds, so without this nearly every dispatch paid that price. When Magic Compose is on, the composer asks the server to warm up as the screen opens: it opens that connection (priming a new one with a single trivial question) and refreshes the cached facts, so the first decision does not pay for them. While you type, at most one request is in the air and a new one starts no more than every 600 ms. `bb magic-compose route "<prompt>" --profile` prints a timeline of where the time went.
@@ -58,11 +62,11 @@ The facts code needs — what each machine is doing, which providers it runs, wh
 ## CLI
 
 ```sh
-bb magic-compose route "<prompt>" [--json] [--profile]   # where would this go? starts nothing
-bb magic-compose spawn "<prompt>" [--json]               # route it and start the thread
+bb magic-compose route "<prompt>" [--json] [--profile] [--draw <0..1>]   # where would this go? starts nothing
+bb magic-compose spawn "<prompt>" [--json] [--draw <0..1>]               # route it and start the thread
 bb magic-compose machines [--json]                       # what Jev is told about each machine
-bb magic-compose rotation get [--json]                   # the model rotation
-bb magic-compose rotation set '<json>'                   # replace it
+bb magic-compose rotation get [--json]                   # the model rotation and the random share
+bb magic-compose rotation set '<json>'                   # an array replaces the rotation; {entries, share} replaces what it names
 bb magic-compose preferences get [--json]                # the instructions and the other preferences
 bb magic-compose preferences set <key> <value>           # set one, for example modelInstructions
 bb magic-compose history [--days 14] [--json]            # the model and effort you chose per thread
