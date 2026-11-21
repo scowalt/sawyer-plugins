@@ -39,6 +39,8 @@ import {
 
 const SCOPE_KEY = "scope";
 const PREFERENCES_KEY = "preferences";
+/** Kept by versions that picked the model; nothing reads them now. */
+const RETIRED_KEYS = ["rotation", "share", "shareDraws"];
 const RECENT_TITLES_PER_PROJECT = 4;
 const STATS_TIMEOUT_MS = 2_500;
 const STATS_FRESH_MS = 15_000;
@@ -305,6 +307,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
+  void Promise.all(RETIRED_KEYS.map(key => bb.storage.kv.delete(key))).catch((error: unknown) => {
+    bb.log.warn(`Magic Compose could not clear its retired settings: ${error instanceof Error ? error.message : String(error)}`);
+  });
   // The warm connections to Jev belong to this load of the plugin.
   bb.onDispose(() => jevTransport.close());
 
