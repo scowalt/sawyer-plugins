@@ -11,6 +11,53 @@ export interface HistoryRow {
   model: string;
   effort: string;
   prompt: string;
+  /** Set when the random share, not the user, chose this thread's model. What Jev had picked. */
+  share: { replaced: { providerId: string; model: string; effort: string } } | null;
+}
+
+/** What the server remembers of a share draw, so history can tell the thread it started. */
+export interface ShareDraw {
+  /** One entry per draft: the draw value as a string for composer previews, a fresh id otherwise. */
+  key: string;
+  at: number;
+  /** The routed prompt, normalized like `HistoryRow.prompt` (whitespace collapsed, trimmed), first 300 chars. */
+  prompt: string;
+  target: { providerId: string; model: string };
+  replaced: { providerId: string; model: string; effort: string };
+}
+
+export const SHARE_DRAW_PROMPT_CHARS = 300;
+/** A thread is created after the draw, but its clock may be a little behind the server's. */
+const DRAW_CLOCK_SKEW_MS = 60_000;
+/** The longest a draft sits in the composer before it is sent. */
+const DRAW_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+export function normalizePrompt(text: string): string {
+  return text.replace(/\s+/gu, " ").trim();
+}
+
+/**
+ * Rows whose model came from a share draw, marked with what Jev had picked.
+ * A draw matches a thread that ran on its target, began with its prompt, and
+ * was created soon after it; the latest such draw wins.
+ */
+export function markShareDraws(
+  rows: readonly HistoryRow[],
+  draws: readonly ShareDraw[],
+): HistoryRow[] {
+  const latestFirst = [...draws].sort((a, b) => b.at - a.at);
+  return rows.map((row) => {
+    const draw = latestFirst.find(
+      (candidate) =>
+        candidate.prompt !== "" &&
+        candidate.target.providerId === row.providerId &&
+        candidate.target.model === row.model &&
+        row.prompt.startsWith(candidate.prompt) &&
+        candidate.at <= row.createdAt + DRAW_CLOCK_SKEW_MS &&
+        row.createdAt - candidate.at <= DRAW_MAX_AGE_MS,
+    );
+    return draw === undefined ? row : { ...row, share: { replaced: draw.replaced } };
+  });
 }
 
 /** Greetings and connection tests say nothing about how the user picks models. */
@@ -43,12 +90,13 @@ export function mappedModel(model: string, mappings: readonly ModelMapping[]): s
   return mappings.find((mapping) => mapping.pattern.test(model))?.model ?? model;
 }
 
-/** Counts of threads per model and effort, most used model first. */
+/** Counts of the user's own choices per model and effort, most used model first. */
 export function tally(
   rows: readonly HistoryRow[],
 ): { model: string; total: number; efforts: Record<string, number> }[] {
   const byModel = new Map<string, Record<string, number>>();
   for (const row of rows) {
+    if (row.share !== null) continue;
     const efforts = byModel.get(row.model) ?? {};
     efforts[row.effort] = (efforts[row.effort] ?? 0) + 1;
     byModel.set(row.model, efforts);
@@ -62,9 +110,31 @@ export function tally(
     .sort((a, b) => b.total - a.total);
 }
 
+/** The threads the share chose, apart from the user's own choices: where they ran and what they replaced. */
+export function shareTally(rows: readonly HistoryRow[]): {
+  total: number;
+  models: string[];
+  replaced: Record<string, number>;
+} {
+  const drawn = rows.filter((row) => row.share !== null);
+  const replaced: Record<string, number> = {};
+  for (const row of drawn) {
+    const key = `${row.share?.replaced.model} ${row.share?.replaced.effort}`;
+    replaced[key] = (replaced[key] ?? 0) + 1;
+  }
+  return { total: drawn.length, models: [...new Set(drawn.map((row) => row.model))], replaced };
+}
+
 export interface BacktestSelection {
   rows: HistoryRow[];
-  skipped: { noise: number; excluded: number; notInRotation: number; duplicate: number };
+  skipped: {
+    noise: number;
+    excluded: number;
+    notInRotation: number;
+    duplicate: number;
+    /** The share chose these, so they say nothing about what Jev should have picked. */
+    shareDraw: number;
+  };
 }
 
 /** One thread per distinct prompt, model, and effort; noise and excluded prompts dropped. */
@@ -76,12 +146,13 @@ export function backtestRows(
     rotation: ReadonlySet<string>;
   },
 ): BacktestSelection {
-  const skipped = { noise: 0, excluded: 0, notInRotation: 0, duplicate: 0 };
+  const skipped = { noise: 0, excluded: 0, notInRotation: 0, duplicate: 0, shareDraw: 0 };
   const seen = new Set<string>();
   const kept: HistoryRow[] = [];
   for (const row of rows) {
     const model = mappedModel(row.model, options.mappings);
-    if (isNoise(row.prompt)) skipped.noise++;
+    if (row.share !== null) skipped.shareDraw++;
+    else if (isNoise(row.prompt)) skipped.noise++;
     else if (options.exclude?.test(row.prompt)) skipped.excluded++;
     else if (!options.rotation.has(model)) skipped.notInRotation++;
     else {

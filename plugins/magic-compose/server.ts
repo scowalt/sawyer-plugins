@@ -17,6 +17,7 @@ import { jevTransport } from "./lib/transport";
 import { SwrCache } from "./lib/cache";
 import {
   backtestRows,
+  normalizePrompt,
   parseMapping,
   score,
   tally,
@@ -1057,11 +1058,12 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: thread.providerId,
           model,
           effort: reasoningLevel,
-          prompt: (turn.data.input ?? [])
-            .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
-            .join(" ")
-            .replace(/\s+/gu, " ")
-            .trim(),
+          prompt: normalizePrompt(
+            (turn.data.input ?? [])
+              .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+              .join(" "),
+          ),
+          share: null,
         };
       } catch {
         return null;

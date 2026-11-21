@@ -3,10 +3,14 @@ import {
   backtestRows,
   isNoise,
   mappedModel,
+  markShareDraws,
+  normalizePrompt,
   parseMapping,
   score,
+  shareTally,
   tally,
   type HistoryRow,
+  type ShareDraw,
 } from "./history";
 
 function row(overrides: Partial<HistoryRow> = {}): HistoryRow {
@@ -18,6 +22,7 @@ function row(overrides: Partial<HistoryRow> = {}): HistoryRow {
     model: "astra",
     effort: "medium",
     prompt: "Fix the sidebar flicker when a plugin reloads",
+    share: null,
     ...overrides,
   };
 }
@@ -77,7 +82,86 @@ describe("backtestRows", () => {
       ["astra", "medium"],
       ["fable", "xhigh"],
     ]);
-    expect(skipped).toEqual({ noise: 1, excluded: 1, notInRotation: 1, duplicate: 1 });
+    expect(skipped).toEqual({ noise: 1, excluded: 1, notInRotation: 1, duplicate: 1, shareDraw: 0 });
+  });
+});
+
+const MINUTE = 60_000;
+const neon = { providerId: "acp-antigravity-acp", model: "gemini-4-neon" };
+const drawn: ShareDraw = {
+  key: "0.1234",
+  at: 1_000_000,
+  prompt: "Fix the sidebar flicker",
+  target: neon,
+  replaced: { providerId: "pi", model: "claude-opus-5-5", effort: "xhigh" },
+};
+const neonRow = (overrides: Partial<HistoryRow> = {}) =>
+  row({ ...neon, effort: "high", createdAt: drawn.at + 5_000, ...overrides });
+
+describe("markShareDraws", () => {
+  it("marks a thread that began with a drawn prompt on the target soon after", () => {
+    const [marked] = markShareDraws([neonRow()], [drawn]);
+    expect(marked?.share).toEqual({ replaced: drawn.replaced });
+  });
+
+  it("leaves alone a thread on another model, another prompt, or outside the time window", () => {
+    const rows = [
+      neonRow({ providerId: "pi", model: "claude-opus-5-5" }),
+      neonRow({ prompt: "Add a dark mode toggle" }),
+      neonRow({ createdAt: drawn.at - 2 * MINUTE }),
+      neonRow({ createdAt: drawn.at + 7 * 60 * MINUTE }),
+    ];
+    expect(markShareDraws(rows, [drawn]).map((entry) => entry.share)).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("takes the latest of several matching draws", () => {
+    const later: ShareDraw = {
+      ...drawn,
+      key: "0.9",
+      at: drawn.at + MINUTE,
+      replaced: { providerId: "pi", model: "claude-sonnet-5-5", effort: "medium" },
+    };
+    const [marked] = markShareDraws([neonRow({ createdAt: later.at + 1_000 })], [drawn, later]);
+    expect(marked?.share?.replaced.model).toBe("claude-sonnet-5-5");
+  });
+});
+
+describe("normalizePrompt", () => {
+  it("collapses whitespace like a history row's prompt", () => {
+    expect(normalizePrompt("  fix\n the   bug ")).toBe("fix the bug");
+  });
+});
+
+describe("share draws apart from the user's choices", () => {
+  const share = { replaced: drawn.replaced };
+  const rows = [row(), neonRow({ share }), neonRow({ share, effort: "high" })];
+
+  it("tally counts only what the user chose", () => {
+    expect(tally(rows)).toEqual([{ model: "astra", total: 1, efforts: { medium: 1 } }]);
+  });
+
+  it("shareTally reports the draws and what they replaced", () => {
+    expect(shareTally(rows)).toEqual({
+      total: 2,
+      models: ["gemini-4-neon"],
+      replaced: { "claude-opus-5-5 xhigh": 2 },
+    });
+  });
+
+  it("backtestRows counts a draw as left out and never scores it", () => {
+    const { rows: kept, skipped } = backtestRows(rows, {
+      mappings: [],
+      exclude: null,
+      rotation: new Set(["astra", "gemini-4-neon"]),
+    });
+    expect(kept.map((entry) => entry.model)).toEqual(["astra"]);
+    expect(skipped.shareDraw).toBe(2);
+    expect(skipped.notInRotation).toBe(0);
   });
 });
 
