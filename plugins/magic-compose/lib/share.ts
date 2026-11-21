@@ -46,8 +46,16 @@ export interface UsageWindow {
 }
 
 export type UsageReading =
-  | { status: "ok"; windows: readonly UsageWindow[] }
+  | {
+      status: "ok";
+      windows: readonly UsageWindow[];
+      /** When it was read, for a reading served from a cache. */
+      readAt?: number;
+    }
   | { status: "unknown"; reason: string };
+
+/** A reading older than this says how old it is in the decision's note. */
+const READING_AGE_SHOWN_AFTER_MS = 5 * 60_000;
 
 const usageWindowSchema = z.object({
   label: z.string(),
@@ -90,10 +98,13 @@ export function usageReadingFrom(
  * the first machine's reason why.
  */
 export function firstKnownReading(readings: readonly UsageReading[]): UsageReading {
-  return (
-    readings.find((reading) => reading.status === "ok") ??
-    readings[0] ?? { status: "unknown", reason: "no machine to read it from" }
-  );
+  let newest: UsageReading | undefined;
+  for (const reading of readings) {
+    if (reading.status !== "ok") continue;
+    // The newest wins, the earlier one on a tie.
+    if (newest?.status !== "ok" || (reading.readAt ?? 0) > (newest.readAt ?? 0)) newest = reading;
+  }
+  return newest ?? readings[0] ?? { status: "unknown", reason: "no machine to read it from" };
 }
 
 export type ShareUsageState = "headroom" | "scaled" | "unknown" | "over";
@@ -179,6 +190,10 @@ function weeklyPace(window: UsageWindow, now: number): number | null {
 }
 
 const percent = (value: number) => `${Math.round(value)}%`;
+function formatAge(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  return minutes < 60 ? `${minutes} min` : `${Math.round(minutes / 60)} h`;
+}
 const oddsPercent = (value: number) => `${Math.round(value * 100)}%`;
 
 export function gateShare(rule: ShareRule, reading: UsageReading, now: number): ShareGate {
@@ -209,15 +224,19 @@ export function gateShare(rule: ShareRule, reading: UsageReading, now: number): 
       note: `usage unknown: "${group}" has reset since the last reading`,
     };
   }
+  const age =
+    reading.readAt !== undefined && now - reading.readAt > READING_AGE_SHOWN_AFTER_MS
+      ? ` · read ${formatAge(now - reading.readAt)} ago`
+      : "";
   if (session !== null && session.usedPercent >= maxSessionPercent) {
-    return { usage: "over", odds: 0, note: `${group} 5h ${percent(session.usedPercent)}` };
+    return { usage: "over", odds: 0, note: `${group} 5h ${percent(session.usedPercent)}${age}` };
   }
   if (weekly !== null && weekly.usedPercent >= maxWeeklyPercent) {
-    return { usage: "over", odds: 0, note: `${group} weekly ${percent(weekly.usedPercent)}` };
+    return { usage: "over", odds: 0, note: `${group} weekly ${percent(weekly.usedPercent)}${age}` };
   }
   const used =
     `${group} 5h ${session === null ? "unknown" : percent(session.usedPercent)}, ` +
-    `weekly ${weekly === null ? "unknown" : percent(weekly.usedPercent)}`;
+    `weekly ${weekly === null ? "unknown" : percent(weekly.usedPercent)}${age}`;
   const pace = weekly === null ? null : weeklyPace(weekly, now);
   if (pace !== null && pace > 1) {
     const odds = base / pace;

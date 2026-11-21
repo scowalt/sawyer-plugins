@@ -636,14 +636,24 @@ export default async function plugin(bb: BbPluginApi) {
   const usageCache = new SwrCache<UsageReading>(
     async (key) => {
       const [hostId = "", sourceId = ""] = key.split("\u0000");
-      const response = await withTimeout(
-        (signal) => bb.sdk.system.usageLimits({ hostId, providerId: sourceId, signal }),
-        SHARE_FACT_TIMEOUT_MS,
-      );
+      let response: Record<string, unknown>;
+      try {
+        response = await withTimeout(
+          (signal) => bb.sdk.system.usageLimits({ hostId, providerId: sourceId, signal }),
+          SHARE_FACT_TIMEOUT_MS,
+        );
+      } catch (error) {
+        bb.log.warn(`quota read failed on ${hostId}: ${messageOf(error)}`);
+        throw error;
+      }
       const reading = usageReadingFrom(sourceId, response);
-      // Not cached: the last good reading stays, and the next decision asks again.
-      if (reading.status === "unknown") throw new Error(reading.reason);
-      return reading;
+      if (reading.status === "unknown") {
+        // A machine without the source is expected; a source that failed is news.
+        if (sourceId in response) bb.log.warn(`quota read failed on ${hostId}: ${reading.reason}`);
+        // Not cached: the last good reading stays, and the next decision asks again.
+        throw new Error(reading.reason);
+      }
+      return { ...reading, readAt: Date.now() };
     },
     USAGE_FRESH_MS,
     USAGE_STALE_MS,

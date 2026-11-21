@@ -357,6 +357,21 @@ describe("shareBlocked", () => {
 });
 
 describe("gateShare with an old reading", () => {
+  it("says how old a reading is once it is past a few minutes", () => {
+    const read = (ago: number, windows = [fiveHour(12), weekly(30)]): UsageReading => ({
+      status: "ok",
+      windows,
+      readAt: NOW - ago,
+    });
+    expect(gateShare(rule, read(2 * 60_000), NOW).note).toBe("Gemini Models 5h 12%, weekly 30%");
+    expect(gateShare(rule, read(40 * 60_000), NOW).note).toBe(
+      "Gemini Models 5h 12%, weekly 30% · read 40 min ago",
+    );
+    expect(gateShare(rule, read(6 * 60 * 60_000, [fiveHour(91)]), NOW).note).toBe(
+      "Gemini Models 5h 91% · read 6 h ago",
+    );
+  });
+
   const resetAt = (window: UsageWindow, at: number): UsageWindow => ({
     ...window,
     resetsAt: new Date(at).toISOString(),
@@ -393,6 +408,14 @@ describe("firstKnownReading", () => {
     const empty: UsageReading = { status: "unknown", reason: "no reading from usage-pace-antigravity yet" };
     const full = ok(fiveHour(91), weekly(30, 0.5));
     expect(gateShare(rule, firstKnownReading([empty, full]), NOW).usage).toBe("over");
+  });
+
+  it("takes the newest good reading, the thread's machine on a tie", () => {
+    const stale: UsageReading = { status: "ok", windows: [fiveHour(10), weekly(30)], readAt: NOW - 6 * 60 * 60_000 };
+    const fresh: UsageReading = { status: "ok", windows: [fiveHour(10), weekly(95)], readAt: NOW - 60_000 };
+    expect(gateShare(rule, firstKnownReading([stale, fresh]), NOW).usage).toBe("over");
+    const twin: UsageReading = { ...stale };
+    expect(firstKnownReading([stale, twin])).toBe(stale);
   });
 
   it("keeps the thread machine's reason when no machine has a reading", () => {
