@@ -56,6 +56,7 @@ import {
 import {
   applyShare,
   DEFAULT_SHARE_USAGE,
+  shareBlocked,
   gateShare,
   usageReadingFrom,
   type ShareDecision,
@@ -71,11 +72,18 @@ const PREFERENCES_KEY = "preferences";
 const MAX_ROTATION_ENTRIES = 24;
 const RECENT_TITLES_PER_PROJECT = 4;
 const STATS_TIMEOUT_MS = 2_500;
-const USAGE_TIMEOUT_MS = 2_500;
+/**
+ * The random share reads each machine's quota and the target's model list there.
+ * Both start before Jev answers and land in a cache for the next decision; a
+ * decision waits for them only briefly after Jev has answered.
+ */
+const SHARE_FACT_TIMEOUT_MS = 8_000;
+const SHARE_FACT_WAIT_MS = 1_000;
 const USAGE_FRESH_MS = 3 * 60_000;
 const USAGE_STALE_MS = 15 * 60_000;
-/** How long a decision waits for a quota reading still loading once Jev has answered. */
-const USAGE_WAIT_MS = 1_000;
+/** Listing a provider's models on a machine starts its agent, so the answer is kept a while. */
+const TARGET_CATALOG_FRESH_MS = 5 * 60_000;
+const TARGET_CATALOG_STALE_MS = 30 * 60_000;
 const SHARE_DRAWS_KEPT = 500;
 const SHARE_DRAWS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATS_FRESH_MS = 15_000;
@@ -606,13 +614,13 @@ export default async function plugin(bb: BbPluginApi) {
     SERVE_STALE_MS,
   );
 
-  const usageKey = (hostId: string, sourceId: string) => `${hostId}\u0000${sourceId}`;
+  const hostKey = (hostId: string, id: string) => `${hostId}\u0000${id}`;
   const usageCache = new SwrCache<UsageReading>(
     async (key) => {
       const [hostId = "", sourceId = ""] = key.split("\u0000");
       const response = await withTimeout(
         (signal) => bb.sdk.system.usageLimits({ hostId, providerId: sourceId, signal }),
-        USAGE_TIMEOUT_MS,
+        SHARE_FACT_TIMEOUT_MS,
       );
       return usageReadingFrom(sourceId, response);
     },
@@ -623,9 +631,34 @@ export default async function plugin(bb: BbPluginApi) {
   /** What the source says the share's quota group has used. A failed read is unknown, not empty. */
   async function readUsage(hostId: string, rule: ShareRule): Promise<UsageReading> {
     try {
-      return await usageCache.get(usageKey(hostId, rule.usage.sourceId));
+      return await usageCache.get(hostKey(hostId, rule.usage.sourceId));
     } catch (error) {
       return { status: "unknown", reason: messageOf(error) };
+    }
+  }
+
+  // Per machine, because a provider can be listed everywhere yet start only
+  // where its agent is installed: its model list on a machine without the
+  // agent carries a `modelLoadError`.
+  const targetCatalogCache = new SwrCache<ModelCatalog>(
+    (key) => {
+      const [hostId = "", providerId = ""] = key.split("\u0000");
+      return withTimeout(
+        (signal) => bb.sdk.providers.models({ providerId, hostId, signal }),
+        SHARE_FACT_TIMEOUT_MS,
+      );
+    },
+    TARGET_CATALOG_FRESH_MS,
+    TARGET_CATALOG_STALE_MS,
+  );
+
+  /** The share target's models as `hostId` lists them, or null when they could not be read. */
+  async function readTargetCatalog(hostId: string, providerId: string): Promise<ModelCatalog | null> {
+    try {
+      return await targetCatalogCache.get(hostKey(hostId, providerId));
+    } catch (error) {
+      bb.log.warn(`model catalog unavailable for ${providerId} on ${hostId}: ${messageOf(error)}`);
+      return null;
     }
   }
 
@@ -731,62 +764,30 @@ export default async function plugin(bb: BbPluginApi) {
     return { models, catalogs };
   }
 
-  interface SharePlan {
-    rule: ShareRule;
-    target: ModelCandidate;
-    /** Null when the provider's models could not be listed. */
-    catalog: ModelCatalog | null;
-  }
-
-  /** The share rule and its target, or null when there is no share to apply. Never rejects. */
-  async function planShare(): Promise<SharePlan | null> {
+  /** The share rule, or null when there is no share to apply. Never rejects. */
+  async function readActiveShare(): Promise<ShareRule | null> {
     try {
       const rule = await readShare();
-      if (rule === null || rule.share <= 0) return null;
-      let catalog: ModelCatalog | null = null;
-      try {
-        catalog = await bb.sdk.providers.models({ providerId: rule.providerId });
-      } catch (error) {
-        bb.log.warn(`model catalog unavailable for ${rule.providerId}: ${messageOf(error)}`);
-      }
-      const model = catalog?.models.find((candidate) => candidate.model === rule.model);
-      const provider = catalog?.providers.find((candidate) => candidate.id === rule.providerId);
-      return {
-        rule,
-        catalog,
-        target: {
-          providerId: rule.providerId,
-          model: rule.model,
-          note: "",
-          reasoningLevel: rule.reasoningLevel,
-          providerName: provider?.displayName ?? rule.providerId,
-          displayName: model?.displayName ?? rule.model,
-          description: model?.description ?? "",
-        },
-      };
+      return rule === null || rule.share <= 0 ? null : rule;
     } catch (error) {
       bb.log.warn(`could not read the random share: ${messageOf(error)}`);
       return null;
     }
   }
 
-  /** Why the share target cannot run on `machine`, or null when it can. Stricter than Jev's own filter. */
-  function shareBlocked(
-    plan: SharePlan,
-    machine: { id: string; name: string },
-    providers: Map<string, boolean> | null | undefined,
-  ): string | null {
-    const { providerName } = plan.target;
-    if (providers === null || providers === undefined) {
-      return `could not check ${providerName} on ${machine.name}`;
-    }
-    if (providers.get(plan.rule.providerId) !== true) {
-      return `${providerName} is not available on ${machine.name}`;
-    }
-    if (plan.catalog?.models.some((candidate) => candidate.model === plan.rule.model) !== true) {
-      return `${providerName} does not list ${plan.rule.model}`;
-    }
-    return null;
+  /** The share target as a model candidate, named from `catalog` when it has the names. */
+  function shareTarget(rule: ShareRule, catalog: ModelCatalog | null): ModelCandidate {
+    const model = catalog?.models.find((candidate) => candidate.model === rule.model);
+    const provider = catalog?.providers.find((candidate) => candidate.id === rule.providerId);
+    return {
+      providerId: rule.providerId,
+      model: rule.model,
+      note: "",
+      reasoningLevel: rule.reasoningLevel,
+      providerName: provider?.displayName ?? rule.providerId,
+      displayName: model?.displayName ?? rule.model,
+      description: model?.description ?? "",
+    };
   }
 
   interface RoutedThread {
@@ -884,7 +885,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<RoutedThread> {
     const profiler = new Profiler();
     // Read alongside everything else, so the share adds no wait of its own.
-    const sharePlan = planShare();
+    const activeShare = readActiveShare();
     const config = await profiler.time("settings", () => readConfig());
     const routes = await profiler.time("settings.keys", () => jevRoutes());
     if (routes.length === 0) {
@@ -913,11 +914,23 @@ export default async function plugin(bb: BbPluginApi) {
       profiler.time("load.machines", () => loadMachines()),
     ]);
     if (connected.length === 0) throw new RouteError("No machine is connected.");
-    // Jev has not picked a machine yet, so read every machine's quota while it decides.
-    const usageReads = sharePlan.then((plan) =>
-      plan === null
-        ? new Map<string, Promise<UsageReading>>()
-        : new Map(connected.map((entry) => [entry.id, readUsage(entry.id, plan.rule)] as const)),
+    // Jev has not picked a machine yet, so read every machine's quota and the
+    // target's models there while it decides.
+    const shareReads = activeShare.then((rule) =>
+      rule === null
+        ? null
+        : new Map(
+            connected.map(
+              (entry) =>
+                [
+                  entry.id,
+                  {
+                    usage: readUsage(entry.id, rule),
+                    catalog: readTargetCatalog(entry.id, rule.providerId),
+                  },
+                ] as const,
+            ),
+          ),
     );
     // A project checked out only on machines that are offline cannot run
     // anywhere right now, so it is not worth offering.
@@ -1096,22 +1109,27 @@ export default async function plugin(bb: BbPluginApi) {
       ? { ...routed, environment: { ...routed.environment, source: "fallback" } }
       : routed;
     const decision = await profiler.time("share", async () => {
-      const plan = await sharePlan;
-      if (plan === null) return jevDecision;
-      const { rule, target, catalog } = plan;
+      const rule = await activeShare;
+      if (rule === null) return jevDecision;
+      const where = jevDecision.machine.value;
+      let target = shareTarget(rule, null);
       try {
-        const where = jevDecision.machine.value;
-        const blocked = shareBlocked(plan, where, providersByHost.get(where.id));
+        const reads = (await shareReads)?.get(where.id) ?? {
+          usage: readUsage(where.id, rule),
+          catalog: readTargetCatalog(where.id, rule.providerId),
+        };
+        const catalog = await within(SHARE_FACT_WAIT_MS, reads.catalog, undefined);
+        target = shareTarget(rule, catalog ?? null);
+        const blocked = shareBlocked(target, where, providersByHost.get(where.id), catalog);
         // A target that cannot run here is skipped whatever its quota says.
         const gate =
           blocked === null
             ? gateShare(
                 rule,
-                await within(
-                  USAGE_WAIT_MS,
-                  (await usageReads).get(where.id) ?? readUsage(where.id, rule),
-                  { status: "unknown", reason: "the reading is still loading" },
-                ),
+                await within(SHARE_FACT_WAIT_MS, reads.usage, {
+                  status: "unknown",
+                  reason: "the reading is still loading",
+                }),
                 Date.now(),
               )
             : { usage: "unknown" as const, odds: rule.share, note: "usage not checked" };
@@ -1124,7 +1142,7 @@ export default async function plugin(bb: BbPluginApi) {
           draw,
         });
         // So the permission mode below is limited by the provider that will run.
-        if (shared.share?.result.outcome === "drawn" && catalog !== null) {
+        if (shared.share?.result.outcome === "drawn" && catalog) {
           catalogs.set(rule.providerId, catalog);
         }
         return shared;
@@ -1278,7 +1296,10 @@ export default async function plugin(bb: BbPluginApi) {
         ...projects.map((project) => environmentsCache.refresh(project.id)),
         ...(share === null || share.share <= 0
           ? []
-          : connected.map((entry) => usageCache.refresh(usageKey(entry.id, share.usage.sourceId)))),
+          : connected.flatMap((entry) => [
+              usageCache.refresh(hostKey(entry.id, share.usage.sourceId)),
+              targetCatalogCache.refresh(hostKey(entry.id, share.providerId)),
+            ])),
       ]);
       return { warmed: true };
     },

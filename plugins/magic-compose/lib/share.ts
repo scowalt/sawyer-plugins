@@ -201,6 +201,44 @@ export function gateShare(rule: ShareRule, reading: UsageReading, now: number): 
   return { usage: "headroom", odds: base, note: used };
 }
 
+/** What a provider's model list on one machine says, as far as the share needs it. */
+export interface TargetCatalog {
+  /** Set when the provider could not start there, e.g. `missing_executable` where its agent is not installed. */
+  modelLoadError: { code: string } | null;
+  models: readonly { model: string }[];
+}
+
+/**
+ * Why the share target cannot run on `machine`, or null when it can. Stricter
+ * than Jev's own machine filter: a provider list or model list that could not
+ * be read blocks. `providers` is null when the machine's providers could not be
+ * read; `catalog` is undefined when its model list did not arrive in time and
+ * null when it could not be read.
+ */
+export function shareBlocked(
+  target: ModelCandidate,
+  machine: { name: string },
+  providers: ReadonlyMap<string, boolean> | null | undefined,
+  catalog: TargetCatalog | null | undefined,
+): string | null {
+  const { providerName } = target;
+  if (providers === null || providers === undefined) {
+    return `could not check ${providerName} on ${machine.name}`;
+  }
+  if (providers.get(target.providerId) !== true) {
+    return `${providerName} is not available on ${machine.name}`;
+  }
+  if (catalog === undefined) return `${providerName} on ${machine.name} did not list its models in time`;
+  if (catalog === null) return `could not list ${providerName}'s models on ${machine.name}`;
+  if (catalog.modelLoadError !== null) {
+    return `${providerName} cannot start on ${machine.name} (${catalog.modelLoadError.code})`;
+  }
+  if (!catalog.models.some((candidate) => candidate.model === target.model)) {
+    return `${providerName} does not list ${target.model} on ${machine.name}`;
+  }
+  return null;
+}
+
 /** Jev's decision, or the share target in place of its model and effort when `draw` lands. */
 export function applyShare(args: {
   /** Jev's decision, with `share` null. */

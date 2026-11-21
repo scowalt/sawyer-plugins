@@ -4,6 +4,7 @@ import {
   applyShare,
   DEFAULT_SHARE_USAGE,
   gateShare,
+  shareBlocked,
   type ShareGate,
   type ShareRule,
   type UsageReading,
@@ -309,5 +310,47 @@ describe("applyShare", () => {
     expect(count(gateShare(rule, ok(fiveHour(10), weekly(20, 0.5)), NOW))).toBe(2_000);
     // A quarter of the week gone and half the quota used: pace 2.
     expect(count(gateShare(rule, ok(fiveHour(10), weekly(50, 0.25)), NOW))).toBe(1_000);
+  });
+});
+
+describe("shareBlocked", () => {
+  const mac = { name: "scott-macbook-m3" };
+  const listed = new Map([[target.providerId, true]]);
+  const neonListed = { modelLoadError: null, models: [{ model: target.model }] };
+
+  it("lets the target run where its provider is available and lists the model", () => {
+    expect(shareBlocked(target, mac, listed, neonListed)).toBeNull();
+  });
+
+  it("blocks a machine where the provider is listed but its agent cannot start", () => {
+    // What bb reports for an ACP agent whose binary is missing on that machine.
+    const missing = { modelLoadError: { code: "missing_executable" }, models: [] };
+    expect(shareBlocked(target, mac, listed, missing)).toBe(
+      "Google Antigravity cannot start on scott-macbook-m3 (missing_executable)",
+    );
+  });
+
+  it("blocks a machine where the provider is unavailable or its providers could not be read", () => {
+    expect(shareBlocked(target, mac, new Map([[target.providerId, false]]), neonListed)).toBe(
+      "Google Antigravity is not available on scott-macbook-m3",
+    );
+    expect(shareBlocked(target, mac, new Map(), neonListed)).toBe(
+      "Google Antigravity is not available on scott-macbook-m3",
+    );
+    expect(shareBlocked(target, mac, null, neonListed)).toBe(
+      "could not check Google Antigravity on scott-macbook-m3",
+    );
+  });
+
+  it("blocks when the model list is missing, late, or lacks the model", () => {
+    expect(shareBlocked(target, mac, listed, null)).toBe(
+      "could not list Google Antigravity's models on scott-macbook-m3",
+    );
+    expect(shareBlocked(target, mac, listed, undefined)).toBe(
+      "Google Antigravity on scott-macbook-m3 did not list its models in time",
+    );
+    expect(
+      shareBlocked(target, mac, listed, { modelLoadError: null, models: [{ model: "gemini-4-argon" }] }),
+    ).toBe("Google Antigravity does not list gemini-4-neon on scott-macbook-m3");
   });
 });
