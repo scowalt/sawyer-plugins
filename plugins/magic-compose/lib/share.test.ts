@@ -7,6 +7,7 @@ import {
   type ShareGate,
   type ShareRule,
   type UsageReading,
+  usageReadingFrom,
   type UsageWindow,
 } from "./share";
 
@@ -133,6 +134,42 @@ describe("gateShare", () => {
       usage: "headroom",
       note: "Gemini Models 5h unknown, weekly 20%",
     });
+  });
+});
+
+describe("usageReadingFrom", () => {
+  it("reads an ok answer's windows, keeping kind and id when the source gives them", () => {
+    const reading = usageReadingFrom("usage-pace-antigravity", {
+      "usage-pace-antigravity": {
+        status: "ok",
+        planLabel: "Pro",
+        windows: [
+          { label: "Gemini Models · 5h", usedPercent: 12, resetsAt: null, kind: "five-hour", id: "gemini-5h" },
+          { label: "Gemini Models · Weekly", usedPercent: 30, resetsAt: "2026-11-24T05:00:00Z" },
+          { usedPercent: 4 },
+        ],
+      },
+    });
+    expect(reading).toEqual({
+      status: "ok",
+      windows: [
+        { label: "Gemini Models · 5h", usedPercent: 12, resetsAt: null, kind: "five-hour", id: "gemini-5h" },
+        { label: "Gemini Models · Weekly", usedPercent: 30, resetsAt: "2026-11-24T05:00:00Z" },
+      ],
+    });
+  });
+
+  it("is unknown, never 0%, for a missing or signed-out source", () => {
+    expect(usageReadingFrom("usage-pace-antigravity", {})).toEqual({
+      status: "unknown",
+      reason: "no reading from usage-pace-antigravity yet",
+    });
+    expect(
+      usageReadingFrom("usage-pace-antigravity", { "usage-pace-antigravity": { status: "unauthenticated" } }),
+    ).toEqual({ status: "unknown", reason: "usage-pace-antigravity: unauthenticated" });
+    expect(
+      usageReadingFrom("s", { s: { status: "error", message: "quota endpoint down" } }),
+    ).toEqual({ status: "unknown", reason: "s: error: quota endpoint down" });
   });
 });
 

@@ -16,6 +16,7 @@ const decision: DecisionSummary = {
   model: { ...pick("Fable"), providerId: "claude-code", model: "fable" },
   reasoning: pick("max"),
   environment: { ...pick("Worktree"), id: "git-worktree" },
+  share: null,
   latencyMs: 300,
   timings: [],
 };

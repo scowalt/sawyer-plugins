@@ -3,6 +3,7 @@
 // real work. The share follows the target's quota group: it stops when the
 // group is nearly used up and thins out when the week is running hot. Pure
 // logic; server.ts reads the usage and the machines, and draws the number.
+import { z } from "zod";
 import type { ModelCandidate, Pick as RoutePick, RouteDecision } from "./router";
 import type { ReasoningLevel } from "./reasoning";
 
@@ -47,6 +48,41 @@ export interface UsageWindow {
 export type UsageReading =
   | { status: "ok"; windows: readonly UsageWindow[] }
   | { status: "unknown"; reason: string };
+
+const usageWindowSchema = z.object({
+  label: z.string(),
+  usedPercent: z.number(),
+  resetsAt: z.string().nullable().catch(null),
+  kind: z.enum(["five-hour", "weekly"]).optional().catch(undefined),
+  id: z.string().optional().catch(undefined),
+});
+
+/**
+ * What `bb.sdk.system.usageLimits` said about `sourceId`, as a reading. Anything
+ * but an ok answer is unknown, never 0%: a source that is missing or signed out
+ * has not said the group has headroom.
+ */
+export function usageReadingFrom(
+  sourceId: string,
+  response: Record<string, unknown>,
+): UsageReading {
+  const entry = response[sourceId];
+  if (typeof entry !== "object" || entry === null) {
+    return { status: "unknown", reason: `no reading from ${sourceId} yet` };
+  }
+  const { status, message, windows } = entry as Record<string, unknown>;
+  if (status !== "ok") {
+    const detail = typeof message === "string" && message !== "" ? `: ${message}` : "";
+    return { status: "unknown", reason: `${sourceId}: ${String(status)}${detail}` };
+  }
+  return {
+    status: "ok",
+    windows: (Array.isArray(windows) ? windows : []).flatMap((window) => {
+      const parsed = usageWindowSchema.safeParse(window);
+      return parsed.success ? [parsed.data] : [];
+    }),
+  };
+}
 
 export type ShareUsageState = "headroom" | "scaled" | "unknown" | "over";
 
