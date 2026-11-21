@@ -3,6 +3,7 @@ import type { ModelCandidate, Pick, RouteDecision } from "./router";
 import {
   applyShare,
   DEFAULT_SHARE_USAGE,
+  firstKnownReading,
   gateShare,
   shareBlocked,
   type ShareGate,
@@ -352,5 +353,19 @@ describe("shareBlocked", () => {
     expect(
       shareBlocked(target, mac, listed, { modelLoadError: null, models: [{ model: "gemini-4-argon" }] }),
     ).toBe("Google Antigravity does not list gemini-4-neon on scott-macbook-m3");
+  });
+});
+
+describe("firstKnownReading", () => {
+  it("takes another machine's good reading over an empty one on the thread's machine", () => {
+    const empty: UsageReading = { status: "unknown", reason: "no reading from usage-pace-antigravity yet" };
+    const full = ok(fiveHour(91), weekly(30, 0.5));
+    expect(gateShare(rule, firstKnownReading([empty, full]), NOW).usage).toBe("over");
+  });
+
+  it("keeps the thread machine's reason when no machine has a reading", () => {
+    const first: UsageReading = { status: "unknown", reason: "usage-pace-antigravity: unauthenticated" };
+    const second: UsageReading = { status: "unknown", reason: "no reading from usage-pace-antigravity yet" };
+    expect(firstKnownReading([first, second])).toBe(first);
   });
 });

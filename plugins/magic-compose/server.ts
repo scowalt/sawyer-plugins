@@ -56,6 +56,7 @@ import {
 import {
   applyShare,
   DEFAULT_SHARE_USAGE,
+  firstKnownReading,
   shareBlocked,
   gateShare,
   usageReadingFrom,
@@ -1168,16 +1169,26 @@ export default async function plugin(bb: BbPluginApi) {
             ?.catalog ?? null;
         target = shareTarget(rule, named);
         const blocked = checks.find((check) => check.blocked !== null)?.blocked ?? null;
-        const [first] = checks;
+        // Any connected machine's reading will do, the thread's own first.
+        const usageReads = [
+          ...checks.map((check) => check.read.usage),
+          ...[...(reads?.values() ?? [])].map((read) => read.usage),
+        ];
         // A target that cannot run here is skipped whatever its quota says.
         const gate =
-          blocked === null && first !== undefined
+          blocked === null
             ? gateShare(
                 rule,
-                await within(SHARE_FACT_WAIT_MS, first.read.usage, {
-                  status: "unknown",
-                  reason: "the reading is still loading",
-                }),
+                firstKnownReading(
+                  await Promise.all(
+                    usageReads.map((usage) =>
+                      within(SHARE_FACT_WAIT_MS, usage, {
+                        status: "unknown" as const,
+                        reason: "the reading is still loading",
+                      }),
+                    ),
+                  ),
+                ),
                 Date.now(),
               )
             : { usage: "unknown" as const, odds: rule.share, note: "usage not checked" };

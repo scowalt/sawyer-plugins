@@ -84,6 +84,18 @@ export function usageReadingFrom(
   };
 }
 
+/**
+ * The quota belongs to the account, not the machine, but only machines where
+ * the source is installed can read it. The first good reading wins; with none,
+ * the first machine's reason why.
+ */
+export function firstKnownReading(readings: readonly UsageReading[]): UsageReading {
+  return (
+    readings.find((reading) => reading.status === "ok") ??
+    readings[0] ?? { status: "unknown", reason: "no machine to read it from" }
+  );
+}
+
 export type ShareUsageState = "headroom" | "scaled" | "unknown" | "over";
 
 export interface ShareGate {
