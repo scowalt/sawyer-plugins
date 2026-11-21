@@ -622,7 +622,10 @@ export default async function plugin(bb: BbPluginApi) {
         (signal) => bb.sdk.system.usageLimits({ hostId, providerId: sourceId, signal }),
         SHARE_FACT_TIMEOUT_MS,
       );
-      return usageReadingFrom(sourceId, response);
+      const reading = usageReadingFrom(sourceId, response);
+      // Not cached: the last good reading stays, and the next decision asks again.
+      if (reading.status === "unknown") throw new Error(reading.reason);
+      return reading;
     },
     USAGE_FRESH_MS,
     USAGE_STALE_MS,
