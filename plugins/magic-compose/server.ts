@@ -1164,7 +1164,10 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       decision,
       profiler,
-      environmentInputs: inputsByEnvironment.get(decision.environment.value.id) ?? {},
+      // Null for a provider that takes no inputs, which `?? {}` would turn into some.
+      environmentInputs: inputsByEnvironment.has(decision.environment.value.id)
+        ? (inputsByEnvironment.get(decision.environment.value.id) ?? null)
+        : {},
       permissionMode,
     };
   }
