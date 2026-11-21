@@ -23,8 +23,6 @@ const maySetSchema = z
   .object({
     project: z.boolean(),
     placement: z.boolean(),
-    model: z.boolean(),
-    effort: z.boolean(),
   })
   .strict();
 
@@ -32,7 +30,6 @@ const maySetSchema = z
 // not mention the field, and saving one preference would reset all the others.
 const fields = {
   generalInstructions: instructionsSchema,
-  modelInstructions: instructionsSchema,
   projectInstructions: instructionsSchema,
   machineInstructions: instructionsSchema,
   environmentInstructions: instructionsSchema,
@@ -41,7 +38,7 @@ const fields = {
   jevModel: jevModelSchema,
   openRouterJevModel: jevModelSchema,
   openCodeJevModel: jevModelSchema,
-  /** Which of the composer's pickers Magic Compose may set. Effort is chosen per model, so it needs `model`. */
+  /** Which of the composer's pickers Magic Compose may set. */
   maySet: maySetSchema,
   /** Hold the composer's send until the pickers match the draft. */
   holdSend: z.boolean(),
@@ -59,7 +56,6 @@ export const preferencesPatchSchema = z.object(fields).partial().strict();
 
 export const DEFAULT_PREFERENCES: Preferences = {
   generalInstructions: "",
-  modelInstructions: "",
   projectInstructions: "",
   machineInstructions: "",
   environmentInstructions: "",
@@ -67,24 +63,34 @@ export const DEFAULT_PREFERENCES: Preferences = {
   jevModel: DEFAULT_JEV_MODELS.vercel,
   openRouterJevModel: DEFAULT_JEV_MODELS.openrouter,
   openCodeJevModel: DEFAULT_JEV_MODELS.opencode,
-  maySet: { project: true, placement: true, model: true, effort: true },
+  maySet: { project: true, placement: true },
   holdSend: true,
   pace: "typing",
 };
 
 /**
  * What is stored, read as preferences. A preference added since it was stored
- * takes its default; anything unreadable gives the defaults.
+ * takes its default, one removed since (the model instructions, the model and
+ * effort switches) is ignored, and anything unreadable gives the defaults.
  */
 export function readStoredPreferences(stored: unknown): Preferences {
   if (typeof stored !== "object" || stored === null) return DEFAULT_PREFERENCES;
   const record = stored as Record<string, unknown>;
   const maySet =
-    typeof record.maySet === "object" && record.maySet !== null ? record.maySet : {};
+    typeof record.maySet === "object" && record.maySet !== null
+      ? (record.maySet as Record<string, unknown>)
+      : {};
   const parsed = preferencesSchema.safeParse({
     ...DEFAULT_PREFERENCES,
-    ...record,
-    maySet: { ...DEFAULT_PREFERENCES.maySet, ...maySet },
+    ...pickKnown(record, Object.keys(DEFAULT_PREFERENCES)),
+    maySet: {
+      ...DEFAULT_PREFERENCES.maySet,
+      ...pickKnown(maySet, Object.keys(DEFAULT_PREFERENCES.maySet)),
+    },
   });
   return parsed.success ? parsed.data : DEFAULT_PREFERENCES;
+}
+
+function pickKnown(record: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.filter((key) => key in record).map((key) => [key, record[key]]));
 }

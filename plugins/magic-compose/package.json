@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-magic-compose",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Magic Compose",
-    "description": "Switch on Magic Compose in the new-thread composer and Jev picks the project, machine, model, reasoning level, and environment as you type, using your Vercel AI Gateway, OpenRouter, or OpenCode key.",
+    "description": "Switch on Magic Compose in the new-thread composer and Jev picks the project, machine, and environment as you type, using your Vercel AI Gateway, OpenRouter, or OpenCode key. The model and effort come from bb's model autopilot (Usage Pace).",
     "branding": {
       "icon": "./assets/icon.svg"
     },

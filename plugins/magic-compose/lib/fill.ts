@@ -1,11 +1,9 @@
-// What the composer is asked to select for a routing decision. The composer has
-// the last word: it lowers a permission mode above the machine's limit, moves a
-// reasoning level the model lacks to the nearest one it has, and so on, and its
-// pickers show what it settled on.
+// What the composer is asked to select for a routing decision: project, machine
+// and environment. The model and effort are left to bb's model autopilot. The
+// composer has the last word, and its pickers show what it settled on.
 import type { ExperimentalComposerSelection } from "@get-bb/plugin-sdk/app";
 import type { DecisionSummary } from "../server";
 import type { MaySet } from "./preferences";
-import { REASONING_LEVELS } from "./reasoning";
 
 /**
  * The composer selection that carries out `decision`, leaving out the pickers
@@ -15,11 +13,6 @@ export function selectionFor(
   decision: DecisionSummary,
   sets: MaySet,
 ): ExperimentalComposerSelection {
-  // A reasoning pick is labelled with its level.
-  const reasoningLevel = REASONING_LEVELS.find((level) => level === decision.reasoning.label);
-  if (reasoningLevel === undefined) {
-    throw new Error(`Jev picked an unknown reasoning level, “${decision.reasoning.label}”.`);
-  }
   return {
     ...(sets.project ? { projectId: decision.project.id } : {}),
     ...(sets.placement
@@ -33,35 +26,17 @@ export function selectionFor(
           },
         }
       : {}),
-    ...(sets.model
-      ? {
-          providerId: decision.model.providerId,
-          model: decision.model.model,
-          // Jev chose this effort for this model, so it goes only where the model does.
-          ...(sets.effort ? { reasoningLevel } : {}),
-        }
-      : {}),
   };
 }
 
-/**
- * What to tell the user when the random share, not Jev, chose the model the
- * composer is set to. Null when it did not, or when Magic Compose may not set
- * the model anyway.
- */
-export function shareNote(decision: DecisionSummary, sets: MaySet): string | null {
-  const { share } = decision;
-  if (!sets.model || share === null || share.outcome !== "drawn" || share.replaced === null) {
-    return null;
-  }
-  return `Magic Compose: ${decision.model.label} by random share, in place of Jev's ${share.replaced.label}`;
-}
-
+/** What identifies the project and where a selection puts the thread. */
 function placement(selection: ExperimentalComposerSelection): string {
   const environment = selection.environment;
-  if (environment?.type !== "provider") return JSON.stringify(environment ?? null);
-  const machine = environment.machine?.type === "existing" ? environment.machine.hostId : "";
-  return `${selection.projectId ?? ""} ${environment.environmentProviderId} on ${machine}`;
+  const where =
+    environment?.type === "provider"
+      ? `${environment.environmentProviderId} on ${environment.machine?.type === "existing" ? environment.machine.hostId : ""}`
+      : JSON.stringify(environment ?? null);
+  return `${selection.projectId ?? ""} ${where}`;
 }
 
 /**
@@ -73,18 +48,6 @@ export function changedSelection(
   previous: ExperimentalComposerSelection | null,
   next: ExperimentalComposerSelection,
 ): ExperimentalComposerSelection {
-  // A move sets everything again: BB remembers the environment per project,
-  // and each machine has its own model catalog to reconcile against.
-  if (previous === null || placement(previous) !== placement(next)) return next;
-  const sameModel =
-    previous.providerId === next.providerId &&
-    previous.model === next.model &&
-    previous.reasoningLevel === next.reasoningLevel;
-  if (sameModel) return {};
-  // Effort is chosen per model, so the three travel together.
-  return {
-    ...(next.providerId === undefined ? {} : { providerId: next.providerId }),
-    ...(next.model === undefined ? {} : { model: next.model }),
-    ...(next.reasoningLevel === undefined ? {} : { reasoningLevel: next.reasoningLevel }),
-  };
+  // A move sets everything again: BB remembers the environment per project.
+  return previous === null || placement(previous) !== placement(next) ? next : {};
 }
