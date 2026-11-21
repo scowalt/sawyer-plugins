@@ -10,7 +10,7 @@ This is [scowalt](https://github.com/scowalt)'s fork of [SawyerHood/sawyer-plugi
 | Cascade | [`plugins/cascade`](plugins/cascade) | A scrollable, tiled layout for active BB threads. |
 | Compact Nav | [`plugins/compact-nav`](plugins/compact-nav) | Borderless sidebar icon buttons with native ordering and visibility controls. |
 | CoW copy | [`plugins/btrfs-cow`](plugins/btrfs-cow) | An environment provider that uses copy-on-write reflink copies instead of git worktrees (Btrfs/XFS). |
-| Magic Compose | [`plugins/magic-compose`](plugins/magic-compose) | A wand beside the send button on the new-thread composer: switch it on and Jev picks the project, machine, model, reasoning level, and environment as you type. |
+| Magic Compose | [`plugins/magic-compose`](plugins/magic-compose) | A wand beside the send button on the new-thread composer: switch it on and Jev picks the project, machine, and environment as you type; the model and effort come from bb's model autopilot (Usage Pace). |
 | Miku Companion | [`plugins/miku`](plugins/miku) | An event-aware Hatsune Miku companion and theme. |
 | Nav Rail | [`plugins/nav-rail`](plugins/nav-rail) | Sidebar navigation as a vertical icon rail on the left, with New thread beside the back and forward buttons. |
 | OpenRouter Inference | [`plugins/openrouter-inference`](plugins/openrouter-inference) | Thread titles, commit messages, and voice transcription from OpenRouter models, with your own API key. |
