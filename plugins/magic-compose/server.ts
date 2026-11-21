@@ -127,7 +127,7 @@ const DEFAULT_SCOPE: Scope = {
 const pickSchema = z
   .object({
     label: z.string(),
-    source: z.enum(["jev", "only-option", "fallback"]),
+    source: z.enum(["jev", "only-option", "fallback", "share"]),
     probability: z.number().nullable(),
     confidence: z.number().nullable(),
     alternatives: z.array(z.object({ label: z.string(), probability: z.number() }).strict()),

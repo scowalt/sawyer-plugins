@@ -15,6 +15,7 @@
 // which run the model, which environments a machine can create).
 import type { ChoiceAnswer, ChoiceQuestion, JevState } from "./jev";
 import type { ReasoningLevel } from "./reasoning";
+import type { ShareDecision } from "./share";
 
 export { REASONING_LEVELS, type ReasoningLevel } from "./reasoning";
 
@@ -107,8 +108,9 @@ export interface Pick<T> {
   /**
    * `only-option` means no Jev call was needed. `fallback` means none of the
    * user's preferred options could be used, so a backup was taken instead.
+   * `share` means the random share replaced what Jev picked.
    */
-  source: "jev" | "only-option" | "fallback";
+  source: "jev" | "only-option" | "fallback" | "share";
   probability: number | null;
   confidence: number | null;
   /** Runner-up options, best first. */
@@ -123,6 +125,8 @@ export interface RouteDecision {
   machine: Pick<MachineCandidate>;
   reasoning: Pick<ReasoningLevel>;
   environment: Pick<EnvironmentCandidate>;
+  /** What the random share did after Jev picked. Null when there is no share to apply. */
+  share: ShareDecision | null;
   latencyMs: number;
 }
 
@@ -626,5 +630,13 @@ export async function route(args: RouteArgs): Promise<RouteDecision> {
   }
   const environment = await fanout.resolve(environments);
 
-  return { project, model, machine, reasoning, environment, latencyMs: Date.now() - startedAt };
+  return {
+    project,
+    model,
+    machine,
+    reasoning,
+    environment,
+    share: null,
+    latencyMs: Date.now() - startedAt,
+  };
 }
