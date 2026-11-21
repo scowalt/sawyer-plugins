@@ -951,7 +951,8 @@ function ModelsSection() {
         providerId: seed.providerId,
         model: seed.model,
         reasoningLevel: seed.reasoningLevel,
-        share: 0.2,
+        // Off until the user has picked the model and set a percent.
+        share: 0,
         usage: DEFAULT_SHARE_USAGE,
       });
     } catch (cause) {

@@ -1299,9 +1299,11 @@ export default async function plugin(bb: BbPluginApi) {
         ...projects.map((project) => environmentsCache.refresh(project.id)),
         ...(share === null || share.share <= 0
           ? []
-          : connected.flatMap((entry) => [
-              usageCache.refresh(hostKey(entry.id, share.usage.sourceId)),
-              targetCatalogCache.refresh(hostKey(entry.id, share.providerId)),
+          : // Read, not refreshed: listing the target's models starts its agent, and
+            // warming comes as often as every 20 s.
+            connected.flatMap((entry) => [
+              usageCache.get(hostKey(entry.id, share.usage.sourceId)),
+              targetCatalogCache.get(hostKey(entry.id, share.providerId)),
             ])),
       ]);
       return { warmed: true };
