@@ -356,6 +356,38 @@ describe("shareBlocked", () => {
   });
 });
 
+describe("gateShare with an old reading", () => {
+  const resetAt = (window: UsageWindow, at: number): UsageWindow => ({
+    ...window,
+    resetsAt: new Date(at).toISOString(),
+  });
+
+  it("leaves out a 5h window that has reset since it was read", () => {
+    const gate = gateShare(rule, ok(resetAt(fiveHour(95), NOW - 60_000), weekly(30)), NOW);
+    expect(gate.usage).toBe("headroom");
+    expect(gate.odds).toBe(0.2);
+    expect(gate.note).toBe("Gemini Models 5h unknown, weekly 30%");
+  });
+
+  it("still stops at a 5h window that has not reset yet", () => {
+    const gate = gateShare(rule, ok(resetAt(fiveHour(95), NOW + 60_000), weekly(30)), NOW);
+    expect(gate.usage).toBe("over");
+  });
+
+  it("is unknown at the base odds when every window of the group has reset", () => {
+    const gate = gateShare(
+      rule,
+      ok(resetAt(fiveHour(95), NOW - 60_000), resetAt(weekly(95), NOW - 60_000)),
+      NOW,
+    );
+    expect(gate).toEqual({
+      usage: "unknown",
+      odds: 0.2,
+      note: 'usage unknown: "Gemini Models" has reset since the last reading',
+    });
+  });
+});
+
 describe("firstKnownReading", () => {
   it("takes another machine's good reading over an empty one on the thread's machine", () => {
     const empty: UsageReading = { status: "unknown", reason: "no reading from usage-pace-antigravity yet" };

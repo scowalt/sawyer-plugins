@@ -162,6 +162,11 @@ function groupNames(windows: readonly UsageWindow[]): string[] {
   return [...new Set(windows.map((window) => describeWindow(window).name))];
 }
 
+function hasReset(window: UsageWindow, now: number): boolean {
+  const resetsAt = window.resetsAt === null ? Number.NaN : Date.parse(window.resetsAt);
+  return resetsAt <= now;
+}
+
 /** Used over elapsed, for a 7-day window ending at `resetsAt`. Null while it is too early to say. */
 function weeklyPace(window: UsageWindow, now: number): number | null {
   if (window.resetsAt === null) return null;
@@ -182,14 +187,26 @@ export function gateShare(rule: ShareRule, reading: UsageReading, now: number): 
     return { usage: "unknown", odds: base, note: `usage unknown: ${reading.reason}` };
   }
   const { group, maxSessionPercent, maxWeeklyPercent } = rule.usage;
-  const session = groupWindow(reading.windows, group, "5h");
-  const weekly = groupWindow(reading.windows, group, "weekly");
-  if (session === null && weekly === null) {
+  const foundSession = groupWindow(reading.windows, group, "5h");
+  const foundWeekly = groupWindow(reading.windows, group, "weekly");
+  if (foundSession === null && foundWeekly === null) {
     const seen = groupNames(reading.windows);
     return {
       usage: "unknown",
       odds: base,
       note: `usage unknown: no "${group}" windows in ${rule.usage.sourceId}${seen.length === 0 ? "" : ` (saw: ${seen.join(", ")})`}`,
+    };
+  }
+  // A reading can be older than a window: once it resets, its number no longer applies.
+  const current = (window: UsageWindow | null) =>
+    window === null || hasReset(window, now) ? null : window;
+  const session = current(foundSession);
+  const weekly = current(foundWeekly);
+  if (session === null && weekly === null) {
+    return {
+      usage: "unknown",
+      odds: base,
+      note: `usage unknown: "${group}" has reset since the last reading`,
     };
   }
   if (session !== null && session.usedPercent >= maxSessionPercent) {

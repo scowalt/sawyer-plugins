@@ -76,12 +76,20 @@ const STATS_TIMEOUT_MS = 2_500;
 /**
  * The random share reads each machine's quota and the target's model list there.
  * Both start before Jev answers and land in a cache for the next decision; a
- * decision waits for them only briefly after Jev has answered.
+ * decision waits for them only briefly after Jev has answered. A cold read
+ * starts the agent, which takes seconds, and a hung one fails after about 15 s,
+ * so a read gets longer than that in the background.
  */
-const SHARE_FACT_TIMEOUT_MS = 8_000;
+const SHARE_FACT_TIMEOUT_MS = 20_000;
 const SHARE_FACT_WAIT_MS = 1_000;
 const USAGE_FRESH_MS = 3 * 60_000;
-const USAGE_STALE_MS = 15 * 60_000;
+/**
+ * The last good quota reading is served, while a fresh one loads, for this
+ * long. A cold read never fits in a decision's wait, so a shorter limit would
+ * turn the first decision after a quiet spell into "usage unknown". Windows
+ * that have reset since the reading are left out of the gate.
+ */
+const USAGE_STALE_MS = 24 * 60 * 60_000;
 /** Listing a provider's models on a machine starts its agent, so the answer is kept a while. */
 const TARGET_CATALOG_FRESH_MS = 5 * 60_000;
 const TARGET_CATALOG_STALE_MS = 30 * 60_000;
