@@ -355,8 +355,17 @@ export const rpcContract = defineRpcContract({
         text: promptSchema,
         /** Route within this project only, for a composer whose project Magic Compose may not set. */
         projectId: z.string().min(1).nullable().default(null),
-        /** The random share's draw, one per draft, so the answer holds while the user types. */
+        /**
+         * The random share's draw, one per draft, so the answer holds while the
+         * user types. Given only by a composer that may set the model, and a
+         * drawn answer is then remembered for `history`.
+         */
         draw: z.number().min(0).lt(1).nullable().default(null),
+        /**
+         * The composer keeps its own machine, so the share may land on any
+         * machine the project could run on, and must be able to start on each.
+         */
+        anyMachine: z.boolean().default(false),
       })
       .strict(),
     output: z.object({ decision: decisionSchema }).strict(),
@@ -866,13 +875,28 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function decide(
     text: string,
-    projectId: string | null = null,
-    draw?: number,
-    drawKey?: string,
+    options: {
+      projectId?: string | null;
+      draw?: number;
+      /**
+       * Remember a drawn share under this key, for a decision a thread will
+       * start from. Left out for a look that starts nothing (`route`, Try it),
+       * so `history` never takes a thread the user chose for a draw.
+       */
+      recordAs?: string;
+      anyMachine?: boolean;
+    } = {},
   ): Promise<RoutedThread> {
     try {
-      const routed = await decideWithin(text, projectId, draw ?? Math.random());
-      recordShareDraw(text, routed.decision.share, drawKey ?? randomUUID());
+      const routed = await decideWithin(
+        text,
+        options.projectId ?? null,
+        options.draw ?? Math.random(),
+        options.anyMachine ?? false,
+      );
+      if (options.recordAs !== undefined) {
+        recordShareDraw(text, routed.decision.share, options.recordAs);
+      }
       lastAsked = { at: Date.now(), latencyMs: routed.profiler.elapsed(), error: null };
       return routed;
     } catch (error) {
@@ -885,6 +909,7 @@ export default async function plugin(bb: BbPluginApi) {
     text: string,
     projectId: string | null,
     draw: number,
+    anyMachine: boolean,
   ): Promise<RoutedThread> {
     const profiler = new Profiler();
     // Read alongside everything else, so the share adds no wait of its own.
@@ -1117,19 +1142,39 @@ export default async function plugin(bb: BbPluginApi) {
       const where = jevDecision.machine.value;
       let target = shareTarget(rule, null);
       try {
-        const reads = (await shareReads)?.get(where.id) ?? {
-          usage: readUsage(where.id, rule),
-          catalog: readTargetCatalog(where.id, rule.providerId),
-        };
-        const catalog = await within(SHARE_FACT_WAIT_MS, reads.catalog, undefined);
-        target = shareTarget(rule, catalog ?? null);
-        const blocked = shareBlocked(target, where, providersByHost.get(where.id), catalog);
+        // Where the thread may run: Jev's machine, or, for a composer that keeps
+        // its own, any machine Jev could have picked.
+        const places =
+          anyMachine && chosenTargets.machines.length > 0 ? chosenTargets.machines : [where];
+        const reads = await shareReads;
+        const checks = await Promise.all(
+          places.map(async (machine) => {
+            const read = reads?.get(machine.id) ?? {
+              usage: readUsage(machine.id, rule),
+              catalog: readTargetCatalog(machine.id, rule.providerId),
+            };
+            const catalog = await within(SHARE_FACT_WAIT_MS, read.catalog, undefined);
+            const blocked = shareBlocked(
+              shareTarget(rule, catalog ?? null),
+              machine,
+              providersByHost.get(machine.id),
+              catalog,
+            );
+            return { read, catalog, blocked };
+          }),
+        );
+        const named =
+          checks.find((check) => check.catalog?.models.some((entry) => entry.model === rule.model))
+            ?.catalog ?? null;
+        target = shareTarget(rule, named);
+        const blocked = checks.find((check) => check.blocked !== null)?.blocked ?? null;
+        const [first] = checks;
         // A target that cannot run here is skipped whatever its quota says.
         const gate =
-          blocked === null
+          blocked === null && first !== undefined
             ? gateShare(
                 rule,
-                await within(SHARE_FACT_WAIT_MS, reads.usage, {
+                await within(SHARE_FACT_WAIT_MS, first.read.usage, {
                   status: "unknown",
                   reason: "the reading is still loading",
                 }),
@@ -1145,8 +1190,8 @@ export default async function plugin(bb: BbPluginApi) {
           draw,
         });
         // So the permission mode below is limited by the provider that will run.
-        if (shared.share?.result.outcome === "drawn" && catalog) {
-          catalogs.set(rule.providerId, catalog);
+        if (shared.share?.result.outcome === "drawn" && named !== null) {
+          catalogs.set(rule.providerId, named);
         }
         return shared;
       } catch (error) {
@@ -1223,7 +1268,7 @@ export default async function plugin(bb: BbPluginApi) {
     draw?: number,
   ): Promise<{ threadId: string; decision: DecisionSummary }> {
     try {
-      const routed = await decide(text, null, draw);
+      const routed = await decide(text, { draw, recordAs: randomUUID() });
       const summary = summarize(routed);
       const projectId = summary.project.id;
       const thread = await routed.profiler.time("threads.spawn", () => bb.sdk.threads.spawn({
@@ -1366,13 +1411,13 @@ export default async function plugin(bb: BbPluginApi) {
         },
       };
     },
-    preview: async ({ text, projectId, draw }) => {
+    preview: async ({ text, projectId, draw, anyMachine }) => {
       try {
         // A draft's draw doubles as its key, so routing it again replaces its own log entry.
-        const routed =
-          draw === null
-            ? await decide(text, projectId)
-            : await decide(text, projectId, draw, String(draw));
+        const routed = await decide(
+          text,
+          draw === null ? { projectId, anyMachine } : { projectId, anyMachine, draw, recordAs: String(draw) },
+        );
         return { decision: summarize(routed) };
       } catch (error) {
         throw userFacing(error);
@@ -1817,7 +1862,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       try {
         if (command === "route") {
-          const decision = summarize(await decide(prompt.data, null, draw));
+          const decision = summarize(await decide(prompt.data, { draw }));
           return {
             exitCode: 0,
             stdout: json ? JSON.stringify(decision) : formatDecision(decision) + timeline(decision),

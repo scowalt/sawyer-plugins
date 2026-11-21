@@ -229,7 +229,13 @@ function MagicToggle() {
       route: async (text, draw) => {
         // A project Magic Compose may not set is the one to route within.
         const pinned = maySet.project ? null : projectId;
-        const { decision } = await rpc.call("preview", { text, projectId: pinned, draw });
+        const { decision } = await rpc.call("preview", {
+          text,
+          projectId: pinned,
+          // A share draw counts only where it sets the model.
+          draw: maySet.model ? draw : null,
+          anyMachine: !maySet.placement,
+        });
         return { selection: selectionFor(decision, maySet), note: shareNote(decision, maySet) };
       },
       setSelection: (selection) => composer.experimental_setSelection(selection),

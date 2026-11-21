@@ -41,6 +41,8 @@ bb magic-compose history --days 14 --json
   `odds`, so `--draw 0` forces it whenever `odds` is above 0 and `--draw 0.99`
   avoids it. Leave it out for the real chance. A share draw starts a thread
   on the share's model, so use `--draw` with `spawn` only when the user wants that.
+  Only draws that start a thread (`spawn`, or a composer that may set the model)
+  are remembered for `history`; `route` and "Try it" remember nothing.
 - `spawn` routes the prompt and starts a visible thread there. It prints the new
   thread id and the same decision. Only use it when the user asked for a thread
   to be started; starting threads is otherwise outside an agent's remit.
