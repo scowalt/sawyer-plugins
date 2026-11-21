@@ -3,7 +3,6 @@
 // OpenRouter, or OpenCode, then start the thread there. app.tsx owns the
 // composer toggle; this file gathers the candidates, asks Jev, and spawns.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { hostContract, machineStatsSchema } from "./contract";
 import {
@@ -16,19 +15,6 @@ import {
 } from "./lib/jev";
 import { jevTransport } from "./lib/transport";
 import { SwrCache } from "./lib/cache";
-import {
-  backtestRows,
-  markShareDraws,
-  normalizePrompt,
-  parseMapping,
-  score,
-  SHARE_DRAW_PROMPT_CHARS,
-  shareTally,
-  tally,
-  type BacktestResult,
-  type HistoryRow,
-  type ShareDraw,
-} from "./lib/history";
 import { formatSpans, Profiler } from "./lib/profile";
 import {
   DEFAULT_PREFERENCES,
@@ -67,7 +53,6 @@ import {
 
 const ROTATION_KEY = "rotation";
 const SHARE_KEY = "share";
-const SHARE_DRAWS_KEY = "shareDraws";
 const SCOPE_KEY = "scope";
 const PREFERENCES_KEY = "preferences";
 const MAX_ROTATION_ENTRIES = 24;
@@ -93,8 +78,6 @@ const USAGE_STALE_MS = 24 * 60 * 60_000;
 /** Listing a provider's models on a machine starts its agent, so the answer is kept a while. */
 const TARGET_CATALOG_FRESH_MS = 5 * 60_000;
 const TARGET_CATALOG_STALE_MS = 30 * 60_000;
-const SHARE_DRAWS_KEPT = 500;
-const SHARE_DRAWS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATS_FRESH_MS = 15_000;
 /** Which machines hold a project, and what each can create, rarely change. */
 const AVAILABILITY_FRESH_MS = 30_000;
@@ -366,8 +349,7 @@ export const rpcContract = defineRpcContract({
         projectId: z.string().min(1).nullable().default(null),
         /**
          * The random share's draw, one per draft, so the answer holds while the
-         * user types. Given only by a composer that may set the model, and a
-         * drawn answer is then remembered for `history`.
+         * user types. Given only by a composer that may set the model.
          */
         draw: z.number().min(0).lt(1).nullable().default(null),
         /**
@@ -844,54 +826,6 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
-  const shareDrawSchema = z.object({
-    key: z.string(),
-    at: z.number(),
-    prompt: z.string(),
-    target: z.object({ providerId: z.string(), model: z.string() }),
-    replaced: z.object({ providerId: z.string(), model: z.string(), effort: z.string() }),
-  });
-
-  async function readShareDraws(): Promise<ShareDraw[]> {
-    const parsed = z.array(shareDrawSchema).safeParse(await bb.storage.kv.get(SHARE_DRAWS_KEY));
-    return parsed.success ? parsed.data : [];
-  }
-
-  /** Writes queue behind each other, so two decisions at once keep both draws. */
-  let shareDrawsWrite: Promise<void> = Promise.resolve();
-
-  /**
-   * Remember a draw, so `history` can tell the thread it started from the ones
-   * the user chose. One entry per `key`: a draft routed again as it grows
-   * replaces its own. A failed write is logged and never fails the route.
-   */
-  function recordShareDraw(text: string, share: ShareDecision | null, key: string): void {
-    const result = share?.result;
-    if (share === null || result?.outcome !== "drawn") return;
-    const entry: ShareDraw = {
-      key,
-      at: Date.now(),
-      prompt: normalizePrompt(text).slice(0, SHARE_DRAW_PROMPT_CHARS),
-      target: { providerId: share.target.providerId, model: share.target.model },
-      replaced: {
-        providerId: result.replaced.model.value.providerId,
-        model: result.replaced.model.value.model,
-        effort: result.replaced.reasoning.value,
-      },
-    };
-    shareDrawsWrite = shareDrawsWrite.then(async () => {
-      try {
-        const cutoff = Date.now() - SHARE_DRAWS_MAX_AGE_MS;
-        const kept = (await readShareDraws()).filter(
-          (draw) => draw.key !== key && draw.at >= cutoff,
-        );
-        await bb.storage.kv.set(SHARE_DRAWS_KEY, [...kept, entry].slice(-SHARE_DRAWS_KEPT));
-      } catch (error) {
-        bb.log.warn(`could not record the share draw: ${messageOf(error)}`);
-      }
-    });
-  }
-
   /** How the last question to Jev went, for the settings page. Not kept across loads. */
   let lastAsked: { at: number; latencyMs: number | null; error: string | null } | null = null;
 
@@ -905,12 +839,6 @@ export default async function plugin(bb: BbPluginApi) {
     options: {
       projectId?: string | null;
       draw?: number;
-      /**
-       * Remember a drawn share under this key, for a decision a thread will
-       * start from. Left out for a look that starts nothing (`route`, Try it),
-       * so `history` never takes a thread the user chose for a draw.
-       */
-      recordAs?: string;
       anyMachine?: boolean;
     } = {},
   ): Promise<RoutedThread> {
@@ -921,9 +849,6 @@ export default async function plugin(bb: BbPluginApi) {
         options.draw ?? Math.random(),
         options.anyMachine ?? false,
       );
-      if (options.recordAs !== undefined) {
-        recordShareDraw(text, routed.decision.share, options.recordAs);
-      }
       lastAsked = { at: Date.now(), latencyMs: routed.profiler.elapsed(), error: null };
       return routed;
     } catch (error) {
@@ -1305,7 +1230,7 @@ export default async function plugin(bb: BbPluginApi) {
     draw?: number,
   ): Promise<{ threadId: string; decision: DecisionSummary }> {
     try {
-      const routed = await decide(text, { draw, recordAs: randomUUID() });
+      const routed = await decide(text, { draw });
       const summary = summarize(routed);
       const projectId = summary.project.id;
       const thread = await routed.profiler.time("threads.spawn", () => bb.sdk.threads.spawn({
@@ -1450,10 +1375,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     preview: async ({ text, projectId, draw, anyMachine }) => {
       try {
-        // A draft's draw doubles as its key, so routing it again replaces its own log entry.
         const routed = await decide(
           text,
-          draw === null ? { projectId, anyMachine } : { projectId, anyMachine, draw, recordAs: String(draw) },
+          draw === null ? { projectId, anyMachine } : { projectId, anyMachine, draw },
         );
         return { decision: summarize(routed) };
       } catch (error) {
@@ -1462,168 +1386,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const HISTORY_MAX_THREADS = 600;
-  /**
-   * Plugins whose threads the user starts from a composer, choosing the model
-   * themselves. Any other plugin's threads (review bots, automations, this
-   * plugin's own dispatches) were configured once, not chosen per task.
-   */
-  const COMPOSER_PLUGINS = ["quick-compose", "quick-chat"];
-  const HISTORY_PROMPT_CHARS = 400;
-  const firstTurnSchema = z.object({
-    initiator: z.string().optional(),
-    input: z.array(z.object({ type: z.string(), text: z.string().optional() })).optional(),
-    execution: z
-      .object({ model: z.string().optional(), reasoningLevel: z.string().optional() })
-      .optional(),
-  });
-
-  async function inBatches<T, R>(items: readonly T[], size: number, work: (item: T) => Promise<R>) {
-    const results: R[] = [];
-    for (let at = 0; at < items.length; at += size) {
-      results.push(...(await Promise.all(items.slice(at, at + size).map(work))));
-    }
-    return results;
-  }
-
-  /**
-   * The model and effort the user chose for each thread they started, newest
-   * first. Threads started by plugins or automations are left out, this
-   * plugin's included: those choices were not the user's.
-   */
-  async function loadHistory(days: number, extraOrigins: readonly string[]): Promise<HistoryRow[]> {
-    const userOrigins = new Set([...COMPOSER_PLUGINS, ...extraOrigins]);
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    const [projects, draws, threads] = await Promise.all([
-      bb.sdk.projects.list({ includePersonal: true }),
-      readShareDraws(),
-      (async () => {
-        const all: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
-        for (let offset = 0; ; offset += 500) {
-          const page = await bb.sdk.threads.list({ limit: 500, offset });
-          all.push(...page);
-          if (page.length < 500) return all;
-        }
-      })(),
-    ]);
-    const projectNames = new Map(
-      projects.map((project) => [project.id, project.kind === "personal" ? "No project" : project.name]),
-    );
-    const started = threads
-      .filter(
-        (thread) =>
-          thread.createdAt >= cutoff &&
-          thread.parentThreadId === null &&
-          thread.visibility === "visible" &&
-          thread.deletedAt === null &&
-          (thread.originPluginId === null || userOrigins.has(thread.originPluginId ?? "")),
-      )
-      .sort((a, b) => b.createdAt - a.createdAt)
-      .slice(0, HISTORY_MAX_THREADS);
-
-    const rows = await inBatches(started, 16, async (thread): Promise<HistoryRow | null> => {
-      try {
-        const [first] = await bb.sdk.threads.events.list({
-          threadId: thread.id,
-          limit: "1",
-          order: "asc",
-          types: ["client/turn/requested"],
-        });
-        const turn = firstTurnSchema.safeParse(first?.data);
-        if (!turn.success || turn.data.initiator !== "user") return null;
-        const { model, reasoningLevel } = turn.data.execution ?? {};
-        if (model === undefined || reasoningLevel === undefined) return null;
-        return {
-          threadId: thread.id,
-          createdAt: thread.createdAt,
-          project: projectNames.get(thread.projectId) ?? thread.projectId,
-          providerId: thread.providerId,
-          model,
-          effort: reasoningLevel,
-          prompt: normalizePrompt(
-            (turn.data.input ?? [])
-              .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
-              .join(" "),
-          ),
-          share: null,
-        };
-      } catch {
-        return null;
-      }
-    });
-    return markShareDraws(
-      rows.filter((entry) => entry !== null),
-      draws,
-    );
-  }
-
-  /**
-   * Ask Jev, with the current rotation and instructions, which model and
-   * effort it would pick for each past prompt. Only those two questions are
-   * asked: the world is reduced to one project on one machine.
-   */
-  async function backtest(rows: readonly HistoryRow[]): Promise<BacktestResult[]> {
-    const config = await readConfig();
-    const routes = await jevRoutes();
-    if (routes.length === 0) throw new RouteError("Add a Jev API key in Magic Compose settings first.");
-    const [scope, { models, catalogs }] = await Promise.all([
-      readScope(),
-      readRotation().then(loadModels),
-    ]);
-    await warmRoutes(routes);
-    const project: ProjectCandidate = {
-      id: "backtest",
-      name: "backtest",
-      isPersonal: false,
-      gitRemoteUrl: null,
-      sources: [],
-      recentThreadTitles: [],
-    };
-    const machine: MachineCandidate = {
-      id: "backtest",
-      name: "backtest",
-      isServer: true,
-      stats: null,
-      runningThreads: 0,
-      projectPath: null,
-      environmentIds: ["backtest"],
-    };
-    const results = await inBatches(rows, 8, async (row): Promise<BacktestResult | null> => {
-      try {
-        const decision = await route({
-          task: row.prompt,
-          instructions: {
-            general: config.generalInstructions,
-            models: config.modelInstructions,
-            projects: "",
-            machines: "",
-            environments: "",
-          },
-          projects: [project],
-          models,
-          hostNames: new Map(),
-          reasoningLevels: scope.reasoningLevels,
-          ask: (batch) => askChoicesVia(routes, batch),
-          targetsFor: () => ({
-            machines: [machine],
-            environments: [{ id: "backtest", name: "backtest", description: "" }],
-          }),
-          reasoningFor: (model) =>
-            (
-              catalogs.get(model.providerId)?.models.find((entry) => entry.model === model.model)
-                ?.supportedReasoningEfforts ?? []
-            ).map((effort) => ({ level: effort.reasoningEffort, description: effort.description })),
-        });
-        return { row, model: decision.model.value.model, effort: decision.reasoning.value };
-      } catch (error) {
-        bb.log.warn(`backtest skipped ${row.threadId}: ${messageOf(error)}`);
-        return null;
-      }
-    });
-    return results.filter((entry) => entry !== null);
-  }
-
-  const VALUE_FLAGS = new Set(["--days", "--map", "--exclude", "--limit", "--include-origin", "--draw"]);
+  const VALUE_FLAGS = new Set(["--draw"]);
   function parseArgs(argv: readonly string[]) {
     const values = new Map<string, string[]>();
     const switches = new Set<string>();
@@ -1651,10 +1414,6 @@ export default async function plugin(bb: BbPluginApi) {
     "                                             An object replaces what it names: {entries: [...], share: {providerId, model, reasoningLevel, share, usage?} | null}",
     "  bb magic-compose preferences get [--json]  Show the instructions and the other preferences",
     "  bb magic-compose preferences set <key> <value>   Set one, for example modelInstructions",
-    "  bb magic-compose history [--days 14] [--include-origin <plugin-id>]... [--json]",
-    "                                             The model and effort you chose for each thread you started",
-    "  bb magic-compose backtest [--days 14] [--map <regex>=<model>]... [--exclude <regex>] [--limit 250] [--json]",
-    "                                             Route your past prompts through Jev and score agreement with what you chose",
   ].join("\n");
   bb.cli.register({
     name: "magic-compose",
@@ -1685,17 +1444,6 @@ export default async function plugin(bb: BbPluginApi) {
         summary: "Show or set the instructions and the other preferences",
         usage: "bb magic-compose preferences get [--json] | preferences set <key> <value>",
       },
-      {
-        name: "history",
-        summary: "List the model and effort the user chose for each thread they started",
-        usage: "bb magic-compose history [--days 14] [--json]",
-      },
-      {
-        name: "backtest",
-        summary: "Route past prompts through Jev and score agreement with the user's own choices",
-        usage:
-          "bb magic-compose backtest [--days 14] [--map <regex>=<model>]... [--exclude <regex>] [--limit 250] [--json]",
-      },
     ],
     async run(argv) {
       let parsedArgs: ReturnType<typeof parseArgs>;
@@ -1708,7 +1456,6 @@ export default async function plugin(bb: BbPluginApi) {
       const json = switches.has("--json");
       const profile = switches.has("--profile");
       const [command, ...rest] = parsedArgs.rest;
-      const days = Math.min(Math.max(Number(values.get("--days")?.[0] ?? 14) || 14, 1), 90);
       const timeline = (decision: DecisionSummary) =>
         profile ? `\n\n${formatSpans(decision.timings)}` : "";
       if (command === undefined || command === "help" || command === "--help") {
@@ -1799,84 +1546,6 @@ export default async function plugin(bb: BbPluginApi) {
                 )
                 .join("\n"),
         };
-      }
-      if (command === "history") {
-        const rows = await loadHistory(days, values.get("--include-origin") ?? []);
-        const counts = tally(rows);
-        const drawn = shareTally(rows);
-        if (json) {
-          return {
-            exitCode: 0,
-            stdout: JSON.stringify({
-              days,
-              threads: rows.length,
-              counts,
-              shareDraws: { total: drawn.total, replaced: drawn.replaced },
-              rows: rows.map((row) => ({ ...row, prompt: row.prompt.slice(0, HISTORY_PROMPT_CHARS) })),
-            }),
-          };
-        }
-        return {
-          exitCode: 0,
-          stdout: [
-            `${rows.length - drawn.total} threads you started in the last ${days} days:`,
-            ...counts.map(
-              (entry) =>
-                `  ${entry.model.padEnd(28)} ${String(entry.total).padStart(4)}   ${Object.entries(entry.efforts)
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([effort, count]) => `${effort} ${count}`)
-                  .join(", ")}`,
-            ),
-            ...(drawn.total === 0
-              ? []
-              : [
-                  `${drawn.total} threads were random share draws for ${drawn.models.join(", ")}, replacing: ${Object.entries(drawn.replaced)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([replaced, count]) => `${replaced} ${count}`)
-                    .join(", ")}`,
-                ]),
-            "Add --json for every thread's prompt, model, and effort.",
-          ].join("\n"),
-        };
-      }
-      if (command === "backtest") {
-        try {
-          const rotation = await readRotation();
-          if (rotation.length === 0) throw new RouteError("The rotation is empty; there is nothing to test.");
-          const limit = Math.min(Math.max(Number(values.get("--limit")?.[0] ?? 250) || 250, 1), 500);
-          const excludeText = values.get("--exclude")?.[0];
-          const selection = backtestRows(await loadHistory(days, values.get("--include-origin") ?? []), {
-            mappings: (values.get("--map") ?? []).map(parseMapping),
-            exclude: excludeText === undefined ? null : new RegExp(excludeText, "iu"),
-            rotation: new Set(rotation.map((entry) => entry.model)),
-          });
-          const rows = selection.rows.slice(0, limit);
-          const results = await backtest(rows);
-          const scope = await readScope();
-          const scored = score(results, new Set(scope.reasoningLevels));
-          const misses = results
-            .filter((result) => result.model !== result.row.model || result.effort !== result.row.effort)
-            .slice(0, 80)
-            .map((result) => ({
-              you: `${result.row.model} ${result.row.effort}`,
-              jev: `${result.model} ${result.effort}`,
-              prompt: result.row.prompt.slice(0, 200),
-            }));
-          const report = { days, skipped: selection.skipped, failed: rows.length - results.length, ...scored, misses };
-          if (json) return { exitCode: 0, stdout: JSON.stringify(report) };
-          return {
-            exitCode: 0,
-            stdout: [
-              `Backtested ${scored.prompts} past prompts from the last ${days} days.`,
-              `Model:  agrees ${scored.model.agreementPercent}%   (always picking ${scored.model.mostCommon}: ${scored.model.alwaysMostCommonPercent}%)`,
-              `Effort: agrees ${scored.effort.agreementPercent}%, within one level ${scored.effort.withinOneLevelPercent}%   (always picking ${scored.effort.mostCommon}: ${scored.effort.alwaysMostCommonPercent}%)`,
-              `Left out: ${Object.entries(selection.skipped).map(([why, count]) => `${count} ${why}`).join(", ")}.`,
-              "Add --json for the confusion tables and every disagreement.",
-            ].join("\n"),
-          };
-        } catch (error) {
-          return { exitCode: 1, stderr: messageOf(error) };
-        }
       }
       if (command === "machines") {
         const described = await describeMachines();
