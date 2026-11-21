@@ -633,6 +633,13 @@ export default async function plugin(bb: BbPluginApi) {
   );
 
   const hostKey = (hostId: string, id: string) => `${hostId}\u0000${id}`;
+  /** The failure last logged per machine and source, so one that persists is logged once. */
+  const loggedUsageFailures = new Map<string, string>();
+  const logUsageFailure = (key: string, hostId: string, reason: string) => {
+    if (loggedUsageFailures.get(key) === reason) return;
+    loggedUsageFailures.set(key, reason);
+    bb.log.warn(`quota read failed on ${hostId}: ${reason}`);
+  };
   const usageCache = new SwrCache<UsageReading>(
     async (key) => {
       const [hostId = "", sourceId = ""] = key.split("\u0000");
@@ -643,16 +650,17 @@ export default async function plugin(bb: BbPluginApi) {
           SHARE_FACT_TIMEOUT_MS,
         );
       } catch (error) {
-        bb.log.warn(`quota read failed on ${hostId}: ${messageOf(error)}`);
+        logUsageFailure(key, hostId, messageOf(error));
         throw error;
       }
       const reading = usageReadingFrom(sourceId, response);
       if (reading.status === "unknown") {
         // A machine without the source is expected; a source that failed is news.
-        if (sourceId in response) bb.log.warn(`quota read failed on ${hostId}: ${reading.reason}`);
+        if (sourceId in response) logUsageFailure(key, hostId, reading.reason);
         // Not cached: the last good reading stays, and the next decision asks again.
         throw new Error(reading.reason);
       }
+      loggedUsageFailures.delete(key);
       return { ...reading, readAt: Date.now() };
     },
     USAGE_FRESH_MS,
