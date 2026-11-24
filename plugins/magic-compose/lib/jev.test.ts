@@ -84,6 +84,36 @@ describe("askChoice", () => {
     expect(calls).toBe(1);
   });
 
+  it("keeps the generic message when a rejection says nothing, and shows the gateway's reason when it does", async () => {
+    const ask = (body: string) =>
+      askChoice({
+        provider: "openrouter",
+        apiKey: "k",
+        model: "m",
+        state: "s",
+        question,
+        fetchImpl: async () => new Response(body, { status: 403 }),
+      }).then(
+        () => {
+          throw new Error("expected the key to be rejected");
+        },
+        (cause: unknown) => cause as JevError,
+      );
+    expect((await ask("")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+    expect((await ask("{}")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+    expect((await ask(JSON.stringify({ error: { message: "Key disabled." } }))).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403): Key disabled.",
+    );
+    expect((await ask("Forbidden")).message).toBe("OpenRouter rejected the API key (HTTP 403): Forbidden");
+    expect((await ask("<!DOCTYPE html><html><body>403 Forbidden</body></html>")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+  });
+
   it("names the free-tier limit on a 429", async () => {
     const error = await askChoice({
       provider: "vercel",
@@ -241,6 +271,31 @@ describe("askChoice on OpenCode", () => {
     }
   });
 
+  it("passes on why OpenCode refused with a 402, which it also sends when Jev is down", async () => {
+    const ask = (body: string) =>
+      askChoice({
+        provider: "opencode",
+        apiKey: "k",
+        model: "jev-1.13-free",
+        state: "s",
+        question,
+        fetchImpl: async () => new Response(body, { status: 402 }),
+      }).then(
+        () => {
+          throw new Error("expected OpenCode to refuse");
+        },
+        (cause: unknown) => cause as JevError,
+      );
+    const outage = JSON.stringify({
+      error: { type: "server_error", message: "Upstream request failed: Endpoint is unavailable." },
+    });
+    expect(await ask(outage)).toMatchObject({
+      code: "no_credit",
+      message: "OpenCode refused the request (HTTP 402): Upstream request failed: Endpoint is unavailable.",
+    });
+    expect((await ask("")).message).toBe("OpenCode says the account is out of credit (HTTP 402).");
+  });
+
   it("names OpenCode when it rate-limits", async () => {
     const error = await askChoice({
       provider: "opencode",
@@ -250,7 +305,72 @@ describe("askChoice on OpenCode", () => {
       question,
       fetchImpl: respond(429, { error: { message: "Too many requests" } }),
     }).catch((cause: unknown) => cause as JevError);
-    expect(error).toMatchObject({ code: "rate_limited", message: "OpenCode rate-limited Jev (HTTP 429)." });
+    expect(error).toMatchObject({
+      code: "rate_limited",
+      message: "OpenCode rate-limited Jev (HTTP 429): Too many requests",
+    });
+  });
+});
+
+describe("askChoice on OpenCode Go", () => {
+  it("speaks the Go System One endpoint over fetch with its own User-Agent", async () => {
+    let request: { url: string; init: RequestInit } | undefined;
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      request = { url: String(url), init: init ?? {} };
+      return new Response(
+        JSON.stringify({
+          model: "jev-1.14",
+          answers: { q0: { type: "choice", choice: "games", confidence: 0.8, probabilities: { bb: 0.1, games: 0.9 } } },
+          usage: { input_tokens: 336, output_tokens: 39, cost: 0, opencode: { billing_source: "go" } },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const answer = await askChoice({
+        provider: "opencode-go",
+        apiKey: "sk-opencode",
+        model: "jev-1.14",
+        state: { task: "Add a lap counter" },
+        question: { instructions: "Pick the project.", options: { bb: "The BB app.", games: null } },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(request?.url).toBe("https://opencode.ai/inference/go/systemone/v1/systemone");
+      const headers = request?.init.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer sk-opencode");
+      expect(headers["User-Agent"]).toBe("bb-magic-compose");
+      expect(headers["X-Title"]).toBeUndefined();
+      expect(JSON.parse(String(request?.init.body))).toEqual({
+        model: "jev-1.14",
+        state: { task: "Add a lap counter" },
+        questions: {
+          q0: { type: "choice", instructions: "Pick the project.", criteria: { bb: "The BB app.", games: "" } },
+        },
+      });
+      expect(answer).toMatchObject({ choice: "games", confidence: 0.8, inputTokens: 336 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("says a key without Go needs the subscription", async () => {
+    const error = await askChoice({
+      provider: "opencode-go",
+      apiKey: "k",
+      model: "jev-1.14",
+      state: "s",
+      question,
+      fetchImpl: respond(403, {
+        type: "error",
+        error: { type: "EntitlementError", message: "OpenCode Go subscription required." },
+      }),
+    }).catch((cause: unknown) => cause as JevError);
+    expect(error).toBeInstanceOf(JevError);
+    expect(error).toMatchObject({
+      code: "auth",
+      message: "OpenCode Go rejected the API key (HTTP 403): OpenCode Go subscription required.",
+    });
   });
 });
 

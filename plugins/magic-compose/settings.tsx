@@ -742,6 +742,12 @@ function MoreSection() {
             fallback={DEFAULT_PREFERENCES.openCodeJevModel}
             onSave={(openCodeJevModel) => save({ openCodeJevModel })}
           />
+          <ModelIdField
+            label="Jev model id on OpenCode Go"
+            value={preferences.openCodeGoJevModel}
+            fallback={DEFAULT_PREFERENCES.openCodeGoJevModel}
+            onSave={(openCodeGoJevModel) => save({ openCodeGoJevModel })}
+          />
         </Card>
       </Fold>
       <Problem error={error} />

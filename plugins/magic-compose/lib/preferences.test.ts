@@ -45,6 +45,13 @@ describe("readStoredPreferences", () => {
     });
   });
 
+  it("gives a user who stored preferences before OpenCode Go the Go model default", () => {
+    const { openCodeGoJevModel: _go, ...older } = { ...DEFAULT_PREFERENCES, openCodeJevModel: "jev-1.13" };
+    expect(DEFAULT_PREFERENCES.openCodeGoJevModel).toBe("jev-1.14");
+    expect(readStoredPreferences(older)).toEqual({ ...DEFAULT_PREFERENCES, openCodeJevModel: "jev-1.13" });
+    expect(readStoredPreferences({ ...older, openCodeGoJevModel: "jev-1.15" }).openCodeGoJevModel).toBe("jev-1.15");
+  });
+
   it("loads preferences stored before the model and effort were removed, dropping those keys", () => {
     const stored = {
       ...DEFAULT_PREFERENCES,
