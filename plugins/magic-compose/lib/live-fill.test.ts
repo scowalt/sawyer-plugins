@@ -169,6 +169,27 @@ describe("createLiveFill", () => {
     expect(h.live.getSnapshot().pending).toBe(false);
   });
 
+  it("starts at most one request a second when the pace is pause", async () => {
+    const h = harness();
+    h.live.setPace("pause");
+    h.live.setEnabled(true);
+    // Short pauses, each just long enough to count, answered at once.
+    for (let i = 1; i <= 20; i++) {
+      h.live.setText("x".repeat(i));
+      await h.advance(PAUSE_MS + 10);
+      for (const route of h.routes) route.resolve("codex");
+      await h.flush();
+    }
+    await h.advance(THROTTLE_MS);
+    for (const route of h.routes) route.resolve("codex");
+    await h.flush();
+    for (let i = 1; i < h.routes.length; i++) {
+      expect((h.routes[i]?.at ?? 0) - (h.routes[i - 1]?.at ?? 0)).toBeGreaterThanOrEqual(THROTTLE_MS);
+    }
+    expect(h.routes.at(-1)?.text).toBe("x".repeat(20));
+    expect(h.live.getSnapshot().pending).toBe(false);
+  });
+
   it("lets the draft go when a round fails, and tries again once it changes", async () => {
     const h = harness();
     h.live.setEnabled(true);

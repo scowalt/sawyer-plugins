@@ -6,8 +6,8 @@
 
 /** Let a burst of typing get going before its first request: no routing "F". */
 export const FIRST_DELAY_MS = 300;
-/** At most one request starts per this long, however fast the typing. */
-export const THROTTLE_MS = 600;
+/** At most one request starts per this long, whatever the pace. */
+export const THROTTLE_MS = 1_000;
 /** With the pace set to "pause": how long typing must stop before Jev is asked. */
 export const PAUSE_MS = 700;
 /** A round slower than this fails, so send is never held for good. */
@@ -111,10 +111,10 @@ export function createLiveFill<Selection>(deps: LiveFillDeps<Selection>): LiveFi
       // A throttle: more typing does not push the next request back.
       return;
     }
-    const dueAt =
-      pace === "pause"
-        ? lastChangeAt + PAUSE_MS
-        : Math.max(dirtySince + FIRST_DELAY_MS, lastStartAt + THROTTLE_MS);
+    const dueAt = Math.max(
+      lastStartAt + THROTTLE_MS,
+      pace === "pause" ? lastChangeAt + PAUSE_MS : dirtySince + FIRST_DELAY_MS,
+    );
     timer = deps.setTimer(
       () => {
         timer = null;
