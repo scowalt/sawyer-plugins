@@ -10,6 +10,9 @@ export const FIRST_DELAY_MS = 300;
 export const THROTTLE_MS = 600;
 /** With the pace set to "pause": how long typing must stop before Jev is asked. */
 export const PAUSE_MS = 700;
+/** However the pace is set, at most this many requests start in any minute. */
+export const MAX_ROUNDS_PER_MINUTE = 10;
+const MINUTE_MS = 60_000;
 /** A round slower than this fails, so send is never held for good. */
 export const ROUND_TIMEOUT_MS = 8_000;
 
@@ -67,17 +70,30 @@ export function createLiveFill<Selection>(deps: LiveFillDeps<Selection>): LiveFi
   let lastStartAt = Number.NEGATIVE_INFINITY;
   let inFlight = false;
   let timer: unknown = null;
+  /** When recent rounds started, oldest first, for the per-minute cap. */
+  let starts: number[] = [];
   /** Names the round whose result still counts. Bumped to disown one in the air. */
   let roundId = 0;
   let snapshot = OFF;
 
   const undecided = () => enabled && text !== "" && text !== settledText;
 
+  /** The earliest a round may start without breaking the per-minute cap. */
+  function allowedAt(): number {
+    const now = deps.now();
+    starts = starts.filter((at) => at > now - MINUTE_MS);
+    if (starts.length < MAX_ROUNDS_PER_MINUTE) return now;
+    return (starts[starts.length - MAX_ROUNDS_PER_MINUTE] ?? now) + MINUTE_MS;
+  }
+
+  /** Out of requests for this minute: the draft goes with what was last applied. */
+  const capped = () => !inFlight && allowedAt() > deps.now();
+
   function publish(): void {
     const next: LiveFillSnapshot = {
       enabled,
       // A failed round lets the draft go rather than hold it on a broken connection.
-      pending: undecided() && error === null,
+      pending: undecided() && error === null && !capped(),
       error,
     };
     if (
@@ -111,10 +127,12 @@ export function createLiveFill<Selection>(deps: LiveFillDeps<Selection>): LiveFi
       // A throttle: more typing does not push the next request back.
       return;
     }
-    const dueAt =
+    const dueAt = Math.max(
+      allowedAt(),
       pace === "pause"
         ? lastChangeAt + PAUSE_MS
-        : Math.max(dirtySince + FIRST_DELAY_MS, lastStartAt + THROTTLE_MS);
+        : Math.max(dirtySince + FIRST_DELAY_MS, lastStartAt + THROTTLE_MS),
+    );
     timer = deps.setTimer(
       () => {
         timer = null;
@@ -132,6 +150,9 @@ export function createLiveFill<Selection>(deps: LiveFillDeps<Selection>): LiveFi
     const routed = text;
     inFlight = true;
     lastStartAt = deps.now();
+    starts.push(lastStartAt);
+    // A capped draft that was let go is held again while it is decided.
+    publish();
     let timeout: unknown = null;
     try {
       const work = (async () => {

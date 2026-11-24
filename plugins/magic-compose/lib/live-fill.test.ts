@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createLiveFill,
   FIRST_DELAY_MS,
+  MAX_ROUNDS_PER_MINUTE,
   PAUSE_MS,
   ROUND_TIMEOUT_MS,
   THROTTLE_MS,
@@ -149,6 +150,31 @@ describe("createLiveFill", () => {
       null,
       ...h.applied.slice(0, -1).map((entry) => entry.selection),
     ]);
+  });
+
+  it("starts no more than the per-minute cap, and lets the draft go while capped", async () => {
+    const h = harness();
+    h.live.setEnabled(true);
+    // Two minutes of steady typing, each round answered at once.
+    for (let i = 1; i <= 1_200; i++) {
+      h.live.setText("x".repeat(i));
+      await h.advance(100);
+      for (const route of h.routes) route.resolve("codex");
+      await h.flush();
+    }
+    const starts = h.routes.map((route) => route.at);
+    for (let i = MAX_ROUNDS_PER_MINUTE; i < starts.length; i++) {
+      expect((starts[i] ?? 0) - (starts[i - MAX_ROUNDS_PER_MINUTE] ?? 0)).toBeGreaterThanOrEqual(60_000);
+    }
+    expect(starts.length).toBeLessThanOrEqual(2 * MAX_ROUNDS_PER_MINUTE + 1);
+    // Capped mid-minute: send is not held for the rest of it.
+    expect(h.live.getSnapshot().pending).toBe(false);
+
+    // Once the minute frees up, the final text is still decided.
+    await h.advance(60_000);
+    for (const route of h.routes) route.resolve("codex");
+    await h.flush();
+    expect(h.routes.at(-1)?.text).toBe("x".repeat(1_200));
   });
 
   it("waits for typing to stop when the pace is pause, and still holds the draft", async () => {

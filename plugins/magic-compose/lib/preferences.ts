@@ -65,7 +65,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   openCodeJevModel: DEFAULT_JEV_MODELS.opencode,
   maySet: { project: true, placement: true },
   holdSend: true,
-  pace: "typing",
+  pace: "pause",
 };
 
 /**
