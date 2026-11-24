@@ -312,6 +312,68 @@ describe("askChoice on OpenCode", () => {
   });
 });
 
+describe("askChoice on OpenCode Go", () => {
+  it("speaks the Go System One endpoint over fetch with its own User-Agent", async () => {
+    let request: { url: string; init: RequestInit } | undefined;
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      request = { url: String(url), init: init ?? {} };
+      return new Response(
+        JSON.stringify({
+          model: "jev-1.14",
+          answers: { q0: { type: "choice", choice: "games", confidence: 0.8, probabilities: { bb: 0.1, games: 0.9 } } },
+          usage: { input_tokens: 336, output_tokens: 39, cost: 0, opencode: { billing_source: "go" } },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const answer = await askChoice({
+        provider: "opencode-go",
+        apiKey: "sk-opencode",
+        model: "jev-1.14",
+        state: { task: "Add a lap counter" },
+        question: { instructions: "Pick the project.", options: { bb: "The BB app.", games: null } },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(request?.url).toBe("https://opencode.ai/inference/go/systemone/v1/systemone");
+      const headers = request?.init.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer sk-opencode");
+      expect(headers["User-Agent"]).toBe("bb-magic-compose");
+      expect(headers["X-Title"]).toBeUndefined();
+      expect(JSON.parse(String(request?.init.body))).toEqual({
+        model: "jev-1.14",
+        state: { task: "Add a lap counter" },
+        questions: {
+          q0: { type: "choice", instructions: "Pick the project.", criteria: { bb: "The BB app.", games: "" } },
+        },
+      });
+      expect(answer).toMatchObject({ choice: "games", confidence: 0.8, inputTokens: 336 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("says a key without Go needs the subscription", async () => {
+    const error = await askChoice({
+      provider: "opencode-go",
+      apiKey: "k",
+      model: "jev-1.14",
+      state: "s",
+      question,
+      fetchImpl: respond(403, {
+        type: "error",
+        error: { type: "EntitlementError", message: "OpenCode Go subscription required." },
+      }),
+    }).catch((cause: unknown) => cause as JevError);
+    expect(error).toBeInstanceOf(JevError);
+    expect(error).toMatchObject({
+      code: "auth",
+      message: "OpenCode Go rejected the API key (HTTP 403): OpenCode Go subscription required.",
+    });
+  });
+});
+
 describe("askChoicesVia", () => {
   const vercel = { provider: "vercel" as const, apiKey: "v", model: "typesafe-ai/jev" };
   const openrouter = { provider: "openrouter" as const, apiKey: "o", model: "typesafe/jev-1.13" };

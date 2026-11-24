@@ -42,10 +42,13 @@ bb magic-compose preferences get --json
 - Every call needs a Vercel AI Gateway, OpenRouter, or OpenCode key, set by the
   user in Settings → Magic Compose. Without one the command exits 1 with a
   message saying so. Do not ask the user to paste the key into chat.
+- To bill Jev to the user's OpenCode Go subscription instead of OpenCode's
+  pay-as-you-go balance, run `bb plugin config magic-compose set jevProvider opencode-go`.
+  It uses the same OpenCode key and `jev-1.14`. `auto` never picks it.
 - `route` and `spawn` each normally make one Jev request. Add `--profile` to
   `route` for a timeline of where the time went. Vercel's free tier
   allows about 10 Jev calls per 5 minutes, so do not loop over many prompts.
 - Treat a pick with confidence under about 0.5 as a guess. Prefer `route` and
   show the user the alternatives before spawning on a guess.
 - The prompt, project names and folders, recent thread titles, and machine names
-  are sent to TypeSafe through Vercel, OpenRouter, or OpenCode. Do not route prompts containing secrets.
+  are sent to TypeSafe through Vercel, OpenRouter, OpenCode, or OpenCode Go. Do not route prompts containing secrets.

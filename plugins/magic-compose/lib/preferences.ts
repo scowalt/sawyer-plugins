@@ -11,6 +11,7 @@ export const DEFAULT_JEV_MODELS = {
   vercel: "typesafe-ai/jev",
   openrouter: "typesafe/jev-1.13",
   opencode: "jev-1.13-free",
+  "opencode-go": "jev-1.14",
 } as const;
 
 export const PERMISSION_MODES = ["accept-edits", "auto", "full"] as const;
@@ -38,6 +39,7 @@ const fields = {
   jevModel: jevModelSchema,
   openRouterJevModel: jevModelSchema,
   openCodeJevModel: jevModelSchema,
+  openCodeGoJevModel: jevModelSchema,
   /** Which of the composer's pickers Magic Compose may set. */
   maySet: maySetSchema,
   /** Hold the composer's send until the pickers match the draft. */
@@ -63,6 +65,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   jevModel: DEFAULT_JEV_MODELS.vercel,
   openRouterJevModel: DEFAULT_JEV_MODELS.openrouter,
   openCodeJevModel: DEFAULT_JEV_MODELS.opencode,
+  openCodeGoJevModel: DEFAULT_JEV_MODELS["opencode-go"],
   maySet: { project: true, placement: true },
   holdSend: true,
   pace: "pause",

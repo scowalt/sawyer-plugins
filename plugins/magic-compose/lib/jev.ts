@@ -1,5 +1,5 @@
-// Jev (TypeSafe's classifier model), reached through either gateway that
-// serves it. Both take a `state` and typed questions and return a choice with
+// Jev (TypeSafe's classifier model), reached through any gateway that serves
+// it. All take a `state` and typed questions and return a choice with
 // probabilities; they differ in URL, headers, and where the confidence sits.
 //
 // - Vercel AI Gateway only serves evaluation models over the AI SDK's wire
@@ -8,11 +8,14 @@
 //   probabilities put the pick second.
 // - OpenRouter serves Jev from its Decisions endpoint, and OpenCode from its
 //   System One endpoint. Both take TypeSafe's own request shape.
+// - OpenCode has two System One endpoints that take the same key but list
+//   different models. The pay-as-you-go one bills the account's credits; the
+//   Go one bills the Go subscription.
 import { z } from "zod";
 import { DEFAULT_JEV_MODELS } from "./preferences";
 import { jevTransport } from "./transport";
 
-export type JevProvider = "vercel" | "openrouter" | "opencode";
+export type JevProvider = "vercel" | "openrouter" | "opencode" | "opencode-go";
 
 export const JEV_PROVIDERS: Record<
   JevProvider,
@@ -20,31 +23,49 @@ export const JEV_PROVIDERS: Record<
     name: string;
     url: string;
     defaultModel: string;
+    keySettingLabel: string;
     keysUrl: string;
     /** Whether the gateway speaks HTTP/2, which the warm connection needs. */
     http2: boolean;
+    headers: Record<string, string>;
   }
 > = {
   vercel: {
     name: "Vercel AI Gateway",
     url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
     defaultModel: DEFAULT_JEV_MODELS.vercel,
+    keySettingLabel: "Vercel AI Gateway API key",
     keysUrl: "https://vercel.com/dashboard → AI Gateway → API keys",
     http2: true,
+    headers: {},
   },
   openrouter: {
     name: "OpenRouter",
     url: "https://openrouter.ai/api/alpha/decisions",
     defaultModel: DEFAULT_JEV_MODELS.openrouter,
+    keySettingLabel: "OpenRouter API key",
     keysUrl: "https://openrouter.ai/keys",
     http2: true,
+    headers: { "X-Title": "BB Magic Compose" },
   },
   opencode: {
     name: "OpenCode",
     url: "https://opencode.ai/inference/systemone/v1/systemone",
     defaultModel: DEFAULT_JEV_MODELS.opencode,
+    keySettingLabel: "OpenCode API key",
     keysUrl: "https://opencode.ai/console",
     http2: false,
+    headers: {},
+  },
+  "opencode-go": {
+    name: "OpenCode Go",
+    url: "https://opencode.ai/inference/go/systemone/v1/systemone",
+    defaultModel: DEFAULT_JEV_MODELS["opencode-go"],
+    keySettingLabel: "OpenCode API key",
+    keysUrl: "https://opencode.ai/console",
+    http2: false,
+    // Go asks clients to identify themselves, not as a generic HTTP library.
+    headers: { "User-Agent": "bb-magic-compose" },
   },
 };
 
@@ -132,6 +153,7 @@ function buildRequest(args: AskChoicesArgs): { headers: Record<string, string>; 
   const base = {
     Authorization: `Bearer ${args.apiKey}`,
     "Content-Type": "application/json",
+    ...JEV_PROVIDERS[args.provider].headers,
   };
   // TypeSafe's shape wants a string for every option; Vercel accepts null.
   const questions = Object.fromEntries(
@@ -151,7 +173,7 @@ function buildRequest(args: AskChoicesArgs): { headers: Record<string, string>; 
   );
   if (args.provider !== "vercel") {
     return {
-      headers: args.provider === "openrouter" ? { ...base, "X-Title": "BB Magic Compose" } : base,
+      headers: base,
       body: { model: args.model, state: args.state, questions },
     };
   }

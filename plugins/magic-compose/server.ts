@@ -64,11 +64,18 @@ const JEV_PROVIDERS_IN_AUTO_ORDER = [
   "openrouter",
   "opencode",
 ] as const satisfies readonly JevProvider[];
-const JEV_PROVIDER_CHOICES = ["auto", ...JEV_PROVIDERS_IN_AUTO_ORDER] as const;
+const JEV_PROVIDERS_NEVER_IN_AUTO = ["opencode-go"] as const satisfies readonly JevProvider[];
+const JEV_PROVIDER_CHOICES = [
+  "auto",
+  ...JEV_PROVIDERS_IN_AUTO_ORDER,
+  ...JEV_PROVIDERS_NEVER_IN_AUTO,
+] as const;
 
 /** The provider the Jev provider setting names, or undefined for `auto`. */
 function chosenJevProvider(setting: string): JevProvider | undefined {
-  return JEV_PROVIDERS_IN_AUTO_ORDER.find((provider) => provider === setting);
+  return [...JEV_PROVIDERS_IN_AUTO_ORDER, ...JEV_PROVIDERS_NEVER_IN_AUTO].find(
+    (provider) => provider === setting,
+  );
 }
 
 
@@ -277,30 +284,30 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     gatewayApiKey: {
       type: "string",
-      label: "Vercel AI Gateway API key",
+      label: JEV_PROVIDERS.vercel.keySettingLabel,
       description:
         "One way to reach Jev; set this, an OpenRouter key, an OpenCode key, or several. Create one in the Vercel dashboard under AI Gateway → API keys. The free tier allows only about 10 Jev calls per 5 minutes; any Gateway credit lifts that.",
       secret: true,
     },
     openRouterApiKey: {
       type: "string",
-      label: "OpenRouter API key",
+      label: JEV_PROVIDERS.openrouter.keySettingLabel,
       description:
         "Another way to reach Jev (typesafe/jev-1.13). Create one at https://openrouter.ai/keys.",
       secret: true,
     },
     openCodeApiKey: {
       type: "string",
-      label: "OpenCode API key",
+      label: JEV_PROVIDERS.opencode.keySettingLabel,
       description:
-        "Another way to reach Jev, with the key from an OpenCode Go or pay-as-you-go account. It uses jev-1.13-free, which OpenCode offers free for a limited time; switch the OpenCode model id under Advanced to jev-1.13 to pay from your OpenCode balance. Find the key at https://opencode.ai/console.",
+        "Another way to reach Jev, with the key from an OpenCode account. Find it at https://opencode.ai/console. The “opencode” provider uses OpenCode's pay-as-you-go endpoint: jev-1.13-free is free for a limited time, and any paid model id bills your OpenCode balance. The “opencode-go” provider uses the same key on your OpenCode Go subscription, with jev-1.14.",
       secret: true,
     },
     jevProvider: {
       type: "select",
       label: "Jev provider",
       description:
-        "Which key to route with. “auto” uses whichever keys are set, asking the Vercel AI Gateway first, then OpenRouter, then OpenCode, each only if the one before fails.",
+        "Which key to route with. “auto” uses whichever keys are set, asking the Vercel AI Gateway first, then OpenRouter, then OpenCode, each only if the one before fails. “opencode-go” bills Jev to your OpenCode Go subscription with the OpenCode key; auto never picks it.",
       options: [...JEV_PROVIDER_CHOICES],
       default: "auto",
     },
@@ -349,11 +356,13 @@ export default async function plugin(bb: BbPluginApi) {
       vercel: secret(config.gatewayApiKey),
       openrouter: secret(config.openRouterApiKey),
       opencode: secret(config.openCodeApiKey),
+      "opencode-go": secret(config.openCodeApiKey),
     };
     const models: Record<JevProvider, string> = {
       vercel: config.jevModel,
       openrouter: config.openRouterJevModel,
       opencode: config.openCodeJevModel,
+      "opencode-go": config.openCodeGoJevModel,
     };
     const chosen = chosenJevProvider(config.jevProvider);
     const order = chosen === undefined ? JEV_PROVIDERS_IN_AUTO_ORDER : [chosen];
@@ -489,7 +498,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new RouteError(
         chosen === undefined
           ? "Add a Vercel AI Gateway, OpenRouter, or OpenCode API key in Magic Compose settings first."
-          : `Add your ${JEV_PROVIDERS[chosen].name} API key in Magic Compose settings, or set the Jev provider to auto.`,
+          : `Add your ${JEV_PROVIDERS[chosen].keySettingLabel} in Magic Compose settings, or set the Jev provider to auto.`,
       );
     }
     const scope = await profiler.time("kv.scope", () => readScope());
