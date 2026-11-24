@@ -167,43 +167,51 @@ function buildRequest(args: AskChoicesArgs): { headers: Record<string, string>; 
   };
 }
 
-function errorMessageFromBody(body: string): string {
+function gatewayMessage(body: string): string | null {
   try {
     const parsed: unknown = JSON.parse(body);
-    if (parsed !== null && typeof parsed === "object") {
-      const error = (parsed as { error?: unknown }).error;
-      if (typeof error === "string") return error;
-      if (error !== null && typeof error === "object") {
-        const message = (error as { message?: unknown }).message;
-        if (typeof message === "string") return message;
-      }
-      const message = (parsed as { message?: unknown }).message;
+    if (parsed === null || typeof parsed !== "object") return null;
+    const error = (parsed as { error?: unknown }).error;
+    if (typeof error === "string") return error;
+    if (error !== null && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
       if (typeof message === "string") return message;
     }
+    const message = (parsed as { message?: unknown }).message;
+    return typeof message === "string" ? message : null;
   } catch {
-    // Not JSON; fall through to the raw text.
+    const text = body.trim().slice(0, 300);
+    // A proxy's HTML error page in front of the gateway says nothing readable.
+    return text === "" || text.startsWith("<") ? null : text;
   }
-  return body.trim().slice(0, 300);
 }
 
 function errorForStatus(provider: JevProvider, status: number, body: string): JevError {
   const { name } = JEV_PROVIDERS[provider];
-  const detail = errorMessageFromBody(body);
+  const reason = gatewayMessage(body);
+  const detail = reason ?? body.trim().slice(0, 300);
   if (status === 401 || status === 403) {
     return new JevError(
       "auth",
-      `${name} rejected the API key (HTTP ${status}). Check the key in Magic Compose settings.`,
+      reason === null
+        ? `${name} rejected the API key (HTTP ${status}). Check the key in Magic Compose settings.`
+        : `${name} rejected the API key (HTTP ${status}): ${reason}`,
     );
   }
   if (status === 402) {
-    return new JevError("no_credit", `${name} says the account is out of credit (HTTP 402).`);
+    return new JevError(
+      "no_credit",
+      reason === null
+        ? `${name} says the account is out of credit (HTTP 402).`
+        : `${name} refused the request (HTTP 402): ${reason}`,
+    );
   }
   if (status === 429 || status === 529) {
     return new JevError(
       "rate_limited",
       provider === "vercel"
         ? `The Vercel AI Gateway rate-limited Jev (HTTP ${status}). The free tier allows about 10 Jev calls per 5 minutes; add Gateway credits to lift it.`
-        : `${name} rate-limited Jev (HTTP ${status}).`,
+        : `${name} rate-limited Jev (HTTP ${status})${reason === null ? "." : `: ${reason}`}`,
     );
   }
   return new JevError(

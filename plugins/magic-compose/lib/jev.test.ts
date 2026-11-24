@@ -84,6 +84,36 @@ describe("askChoice", () => {
     expect(calls).toBe(1);
   });
 
+  it("keeps the generic message when a rejection says nothing, and shows the gateway's reason when it does", async () => {
+    const ask = (body: string) =>
+      askChoice({
+        provider: "openrouter",
+        apiKey: "k",
+        model: "m",
+        state: "s",
+        question,
+        fetchImpl: async () => new Response(body, { status: 403 }),
+      }).then(
+        () => {
+          throw new Error("expected the key to be rejected");
+        },
+        (cause: unknown) => cause as JevError,
+      );
+    expect((await ask("")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+    expect((await ask("{}")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+    expect((await ask(JSON.stringify({ error: { message: "Key disabled." } }))).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403): Key disabled.",
+    );
+    expect((await ask("Forbidden")).message).toBe("OpenRouter rejected the API key (HTTP 403): Forbidden");
+    expect((await ask("<!DOCTYPE html><html><body>403 Forbidden</body></html>")).message).toBe(
+      "OpenRouter rejected the API key (HTTP 403). Check the key in Magic Compose settings.",
+    );
+  });
+
   it("names the free-tier limit on a 429", async () => {
     const error = await askChoice({
       provider: "vercel",
@@ -241,6 +271,31 @@ describe("askChoice on OpenCode", () => {
     }
   });
 
+  it("passes on why OpenCode refused with a 402, which it also sends when Jev is down", async () => {
+    const ask = (body: string) =>
+      askChoice({
+        provider: "opencode",
+        apiKey: "k",
+        model: "jev-1.13-free",
+        state: "s",
+        question,
+        fetchImpl: async () => new Response(body, { status: 402 }),
+      }).then(
+        () => {
+          throw new Error("expected OpenCode to refuse");
+        },
+        (cause: unknown) => cause as JevError,
+      );
+    const outage = JSON.stringify({
+      error: { type: "server_error", message: "Upstream request failed: Endpoint is unavailable." },
+    });
+    expect(await ask(outage)).toMatchObject({
+      code: "no_credit",
+      message: "OpenCode refused the request (HTTP 402): Upstream request failed: Endpoint is unavailable.",
+    });
+    expect((await ask("")).message).toBe("OpenCode says the account is out of credit (HTTP 402).");
+  });
+
   it("names OpenCode when it rate-limits", async () => {
     const error = await askChoice({
       provider: "opencode",
@@ -250,7 +305,10 @@ describe("askChoice on OpenCode", () => {
       question,
       fetchImpl: respond(429, { error: { message: "Too many requests" } }),
     }).catch((cause: unknown) => cause as JevError);
-    expect(error).toMatchObject({ code: "rate_limited", message: "OpenCode rate-limited Jev (HTTP 429)." });
+    expect(error).toMatchObject({
+      code: "rate_limited",
+      message: "OpenCode rate-limited Jev (HTTP 429): Too many requests",
+    });
   });
 });
 
